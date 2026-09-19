@@ -106,15 +106,15 @@ set_trigger_mode() {
     MIRROR=$CONFIG_MIRROR
     SEAMLESS_WANTED=0
     if [ "$INPUT_TRIGGER" = ally-m1 ]; then
-        # The live keyboard service skips Steam mirror actions while direct M1 is ready.
-        # Keep its fallback available if input permissions or a reconnect delay capture.
+        # The keyboard ignores Steam mirror actions while the M1 listener is ready.
+        # Keep mirror mode available if the listener cannot read the device.
         MIRROR=1
         : > "$FALLBACK"
-    elif [ "$INPUT_BACKEND" = inputplumber ] && [ "$MIRROR" = 0 ]; then
+    elif [ "$INPUT_TRIGGER" = inputplumber ] && [ "$MIRROR" = 0 ]; then
         SEAMLESS_WANTED=1
     elif [ "$INPUT_TRIGGER" = mirror ] && [ "$MIRROR" = 0 ] && [ "$LOCAL_TRIGGER" != 1 ]; then
-        # Repair the old unsupported-device seamless mode for this session, preserving
-        # the user's config and intentional hotkey/gesture-only setups.
+        # If no direct trigger, hotkey or gesture is available, use mirror mode.
+        # Keep the saved configuration unchanged.
         MIRROR=1
         : > "$FALLBACK"
     fi

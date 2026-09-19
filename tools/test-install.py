@@ -117,12 +117,11 @@ else:
     for rule in STEAM_RULES:
         assert rules[rule]["acceptfocusrule"] == rules[rule]["opacityactiverule"] == "0"
 
-    # An old shipped Windows icon upgrades once; a later explicit choice is kept.
+    # An upgrade preserves the selected icon when the Bazzite icon is absent.
     (home / ".local/share/handheld-kbd/icons/super/bazzite.svg").unlink()
     config["super_icon"] = "windows"
     config_path.write_text(json.dumps(config))
     run("install.sh")
-    config["super_icon"] = "auto"
     assert json.loads(config_path.read_text()) == config
 
     # Customized upgrades keep every setting and a running supervisor's rule state.
@@ -157,6 +156,9 @@ test "$SEAMLESS_WANTED:$MIRROR" = 0:1 && test -f "$FALLBACK" || exit 1
 INPUT_BACKEND=inputplumber; INPUT_TRIGGER=inputplumber
 set_trigger_mode
 test "$SEAMLESS_WANTED:$MIRROR" = 1:0 && test ! -f "$FALLBACK" || exit 2
+INPUT_TRIGGER=mirror
+set_trigger_mode
+test "$SEAMLESS_WANTED:$MIRROR" = 0:1 && test -f "$FALLBACK" || exit 5
 INPUT_BACKEND=generic; INPUT_TRIGGER=mirror
 set_trigger_mode
 test "$SEAMLESS_WANTED:$MIRROR" = 0:1 && test -f "$FALLBACK" || exit 3
