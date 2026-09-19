@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the real libwayland client ABI with a small socketpair compositor."""
 import array
+import ast
 import ctypes
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import runpy
 import socket
 import struct
 import threading
+from types import SimpleNamespace
 
 
 try:
@@ -147,6 +149,7 @@ notifications = []
 mapped = []
 method = provider["InputMethod"](notifications.append, failures.append, False, lambda: mapped.append(True))
 assert method.context and method.surface
+assert method.context_generation == 1
 assert notifications == [], "only compositor panel visibility may summon the keyboard"
 assert method.lib.wl_display_roundtrip(method.display) >= 0
 assert any(kind == "wl_surface" and opcode == 6 for kind, opcode, _ in requests)
@@ -164,6 +167,7 @@ for _ in range(3):
     assert len(method.listeners) == before, "repeated activation leaked listeners"
 assert method.lib.wl_display_roundtrip(method.display) >= 0
 assert len(mapped) == 4, "each panel commit needs a compositor visibility refresh"
+assert method.context_generation == 7, "activation and deactivation must invalidate old visibility replies"
 method.close()
 thread.join(5)
 server.close()
@@ -171,4 +175,87 @@ for fd in fds:
     os.close(fd)
 assert not failures, failures
 assert not thread.is_alive()
-print("input-method native protocol, early activation, panel mapping and repeated context tests passed")
+
+# Dispatch the actual provider callbacks with controlled DBus reply ordering.
+# No display or PyGObject is needed to reproduce cross-context visibility races.
+source = Path(__file__).resolve().parents[1] / "bin/handheld-kbd-input-method"
+tree = ast.parse(source.read_text())
+main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+callbacks = {"finished", "notify", "appeared", "vanished", "visibility_reply", "visibility_changed", "dismiss"}
+nodes = [node for node in main.body if
+         (isinstance(node, ast.FunctionDef) and node.name in callbacks) or
+         (isinstance(node, ast.Assign) and isinstance(node.value, (ast.Dict, ast.Constant))
+          and any(getattr(target, "id", "") in ("state", "method") for target in node.targets))]
+calls, errors = [], []
+
+
+class DBusError(Exception):
+    pass
+
+
+def finish(result):
+    if isinstance(result, Exception):
+        raise result
+    return SimpleNamespace(unpack=lambda: (result,))
+
+
+bus = SimpleNamespace(call=lambda *args: calls.append(args), call_finish=finish)
+scope = {"bus": bus, "failed": errors.append,
+         "Gio": SimpleNamespace(DBusCallFlags=SimpleNamespace(NONE=0)),
+         "GLib": SimpleNamespace(Variant=lambda signature, values: values, Error=DBusError,
+                                 VariantType=SimpleNamespace(new=lambda signature: signature))}
+exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
+
+
+def query():
+    scope["visibility_changed"]()
+    return calls[-1][-1]
+
+
+def sent():
+    return [args[4][0] for args in calls if args[3] == "InputMethod"]
+
+
+# Panel commit callbacks can run before InputMethod.__init__ has returned.
+early = query()
+scope["method"] = SimpleNamespace(context=100, context_generation=1)
+scope["appeared"]()
+early(bus, True)
+assert sent() == []
+initial = query()
+initial(bus, True)
+assert sent() == [True], "the initial ready context must synchronize visibility"
+
+old, latest = query(), query()
+latest(bus, False)
+old(bus, True)
+assert sent() == [True, False], "a superseded true reply must not reopen the keyboard"
+
+old = query()
+scope["method"].context_generation += 1
+old(bus, False)
+assert sent() == [True, False], "a context change must invalidate even the newest queued reply"
+query()(bus, True)
+assert sent() == [True, False, True], "an old context must not hide its replacement"
+
+old = query()
+returned = []
+scope["dismiss"](None, None, None, None, None, None,
+                 SimpleNamespace(return_value=lambda value: returned.append(value)))
+assert returned == [None] and sent()[-1] is False
+count = len(sent())
+old(bus, True)
+query()(bus, True)  # KWin has not yet dispatched Wayland deactivate.
+scope["vanished"]()
+scope["appeared"]()
+assert len(sent()) == count, "dismissal must suppress queued visibility and restart replay"
+
+scope["method"].context_generation += 1
+query()(bus, True)
+assert sent()[-1] is True and len(sent()) == count + 1, "a fresh text-field tap must reopen"
+old, latest = query(), query()
+old(bus, DBusError("stale request"))
+assert not errors
+latest(bus, DBusError("current request"))
+assert len(errors) == 1 and "current request" in errors[0]
+print("input-method native protocol, context lifecycle and asynchronous visibility/dismissal races passed")

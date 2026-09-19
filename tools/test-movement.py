@@ -160,12 +160,13 @@ with tempfile.TemporaryDirectory() as config_dir:
 main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
 visibility = [n for n in main.body if isinstance(n, ast.FunctionDef)
               and n.name in {"_show", "_hide", "_toggle", "_input_method", "_steam_osk"}]
-state = {"shown": False, "automatic": False, "input_method": False, "hiding": None}
+state = {"shown": False, "automatic": False, "input_method": False, "hiding": None,
+         "shown_at": 0, "m1_until": 0}
 timers, requests = [], []
 bus = SimpleNamespace(call=lambda *args: requests.append(args))
 gio = SimpleNamespace(bus_get_sync=lambda *_: bus, BusType=SimpleNamespace(SESSION=0),
                       DBusCallFlags=SimpleNamespace(NO_AUTO_START=1))
-context = {"state": state, "GAMEMODE": False, "_mark_proven": lambda: None,
+context = {"state": state, "GAMEMODE": False, "_mark_proven": lambda: None, "time": time,
            "w": SimpleNamespace(ensure_placed=lambda: None, show_all=lambda: None,
                                 hide=lambda: None, _debug=lambda text: None,
                                 finish_movement=lambda done: done()),
@@ -216,9 +217,25 @@ with patch.dict(sys.modules, {"gi.repository": SimpleNamespace(Gio=gio),
         assert not state["shown"]
     trigger_ready[0] = False
     context["_steam_osk"]("Toggle")
+    assert not state["shown"]  # delayed Steam event after disconnect is still not a new press
+    # Fallback recovers after the same duplicate-window guard used by KWin.
+    with patch.object(time, "monotonic", return_value=state["m1_until"] + 1):
+        context["_steam_osk"]("Toggle")
     assert state["shown"]  # generic mirror/reconnect fallback remains available
+    state["m1_until"] = 0
     context["_steam_osk"]("Hide")
     assert not state["shown"]
+
+    # Native show can arrive in an earlier GLib batch than the queued physical
+    # press. Event time, not callback priority, determines whether M1 closes it.
+    for pressed_at, expected in ((9.9, True), (10.1, False)):
+        state.update(shown=False, automatic=False, input_method=False, hiding=None)
+        with patch.object(time, "time", return_value=10):
+            context["_input_method"](True)
+        context["_toggle"]("M1", pressed_at)
+        context["_input_method"](False)
+        timers.pop()()
+        assert state["shown"] == expected and not state["automatic"]
 
     # Hiding during a drag waits for the compositor snapshot. A subsequent
     # manual show or automatic field change must cancel that pending hide.

@@ -1451,7 +1451,7 @@ class OSK(Gtk.Window):
 
     def _debug(self, message):
         if self.cfg.get("debug") or os.environ.get("HANDHELD_KBD_DEBUG") == "1":
-            print(f"handheld-kbd: {message}", file=sys.stderr)
+            print(f"handheld-kbd: {time.time():.6f} pid={os.getpid()} {message}", file=sys.stderr)
 
     def next_geometry(self):
         """The helper reads only while unlocked, coalescing motion to one frame."""
@@ -1950,7 +1950,7 @@ _service_keepalive = []
 
 
 def setup_service(show, hide, toggle, set_geometry=None, free_move=None, reset=None,
-                  next_geometry=None, ready=None, input_method=None, steam_osk=None):
+                  next_geometry=None, ready=None, input_method=None, steam_osk=None, debug=None):
     """Expose Show/Hide/Toggle on the session bus.
 
     This is what replaced polling. The KWin script calls these the moment Steam's
@@ -1965,6 +1965,8 @@ def setup_service(show, hide, toggle, set_geometry=None, free_move=None, reset=N
 
     def on_call(conn, sender, path, iface, method, params, invocation):
         try:
+            if debug is not None and method in ("Show", "Hide", "Toggle", "SteamOsk", "InputMethod"):
+                debug("DBus %s received from %s" % (method, sender))
             if method == "InputMethod" and input_method is not None:
                 input_method(params.unpack()[0])
             elif method == "SteamOsk" and steam_osk is not None:
@@ -2227,6 +2229,10 @@ def setup_hotkey(config, toggle):
             for ev in dev.read():
                 if ev.type != e.EV_KEY:
                     continue
+                if codes == {e.KEY_F17}:
+                    from handheld_kbd_backend import hhd_trigger_ready
+                    if hhd_trigger_ready(dev.path):
+                        continue               # the direct M1 listener owns this event
                 if ev.value == 1:
                     pressed.add(ev.code)
                 elif ev.value == 0:
@@ -2318,17 +2324,19 @@ def main():
     open("/tmp/handheld-kbd.pid", "w").write(str(os.getpid()))
     VIS = "/tmp/handheld-kbd.vis"
 
-    state = {"shown": False, "automatic": False, "input_method": False, "hiding": None}
+    state = {"shown": False, "automatic": False, "input_method": False, "hiding": None,
+             "shown_at": 0, "m1_until": 0}
 
     def _setvis(v):
         # The file is for the daemon's benefit; the in-memory flag is what we act on, so a
         # show/hide never waits on disk.
         state["shown"] = (v == "1")
+        w._debug("visibility committed: %s" % ("shown" if state["shown"] else "hidden"))
         try: open(VIS, "w").write(v)
         except Exception: pass
 
-    def _show(*_):
-        w._debug("show requested; shown=%s automatic=%s" % (state["shown"], state["automatic"]))
+    def _show(*_, source="manual"):
+        w._debug("show requested (%s); shown=%s automatic=%s" % (source, state["shown"], state["automatic"]))
         state["hiding"] = None
         state["automatic"] = False
         if state["shown"]:
@@ -2337,20 +2345,22 @@ def main():
         # show made summoning slow. Only redo it when something that affects it changed.
         w.ensure_placed()
         w.show_all()
+        state["shown_at"] = time.time()
         if GAMEMODE:                      # set overlay atoms once gamescope has mapped us
             GLib.timeout_add(250, w.gm_show)
         _mark_proven()
         _setvis("1"); return True
 
-    def _hide(*_, automatic=False):
+    def _hide(*_, automatic=False, source="manual"):
         if not state["shown"]:
             return True
-        w._debug("hide requested; automatic=%s input_method=%s" % (state["automatic"], state["input_method"]))
+        w._debug("hide requested (%s); automatic=%s input_method=%s" % (source, state["automatic"], state["input_method"]))
         if not automatic:
             state["automatic"] = False
         pending = state["hiding"] = object()
         def do_hide():
             if state["hiding"] is not pending:
+                w._debug("obsolete hide cancelled (%s)" % source)
                 return
             state["hiding"] = None
             if GAMEMODE: w.gm_hide()
@@ -2374,27 +2384,36 @@ def main():
                     w._debug("input-method dismissal failed: " + str(ex))
         w.finish_movement(do_hide)
         return True
-    w.hide_cb = _hide                 # the hide key routes through here, so state stays in sync
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, _show, None)
-    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, _hide, None)
+    w.hide_cb = lambda: _hide(source="hide key")
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, lambda *_: _show(source="SIGUSR1"), None)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, lambda *_: _hide(source="SIGUSR2"), None)
 
-    def _toggle(source="manual"):
+    def _toggle(source="manual", event_time=None):
         w._debug("toggle requested (%s); shown=%s automatic=%s" % (source, state["shown"], state["automatic"]))
-        (_hide if state["shown"] and state["hiding"] is None else _show)()
+        if source == "M1":
+            state["m1_until"] = time.monotonic() + 0.7
+            # A native show processed after the physical press must not turn
+            # that press into Hide. Already-open tap keyboards still toggle off.
+            if state["automatic"] and event_time is not None and event_time <= state["shown_at"]:
+                _show(source="M1 takes ownership of concurrent native show")
+                return
+        (_hide if state["shown"] and state["hiding"] is None else _show)(source=source)
 
     def _steam_osk(action):
         from handheld_kbd_backend import hhd_trigger_ready
         # Check and act in the same event-loop callback. A separate GetTrigger
         # reply followed by Toggle could race a reconnect or the physical press.
-        if hhd_trigger_ready():
-            w._debug("Steam OSK trigger ignored; direct M1 listener ready")
+        if hhd_trigger_ready() or time.monotonic() < state["m1_until"]:
+            # Retain the helper's 700ms duplicate-window guard across a device
+            # disconnect too, then allow mirror fallback while discovery retries.
+            w._debug("Steam OSK %s ignored; direct M1 owns visibility" % action)
             return
         if action == "Toggle":
             _toggle("Steam mirror")
         elif action == "Show":
-            _show()
+            _show(source="Steam mirror")
         elif action == "Hide":
-            _hide()
+            _hide(source="Steam mirror")
 
     def _input_method(visible):
         w._debug("Plasma input-method visible=%s; shown=%s automatic=%s" % (visible, state["shown"], state["automatic"]))
@@ -2403,14 +2422,14 @@ def main():
         state["input_method"] = visible
         if visible:
             if not state["shown"]:
-                _show()
+                _show(source="Plasma input method")
                 state["automatic"] = True
             elif state["automatic"]:
                 state["hiding"] = None  # a new text field cancels pending automatic hide
         else:
             def hide_automatic():
                 if not state["input_method"] and state["automatic"]:
-                    _hide(automatic=True)
+                    _hide(automatic=True, source="Plasma input method")
                 return False
             # Moving between text fields can deactivate/reactivate the protocol
             # in one gesture. Never hide a keyboard opened manually by M1.
@@ -2418,7 +2437,7 @@ def main():
 
     def _focus_show():
         if not state["shown"]:            # show-only, idempotent (no auto-hide)
-            _show()
+            _show(source="focus/gesture")
 
     def _setup_input_backend():
         if GAMEMODE:
@@ -2427,18 +2446,19 @@ def main():
         backend = detect_backend(config)
         w._debug("backend detection: " + backend["backend"])
         if backend["trigger"] == "inputplumber":
-            setup_dbus_trigger(config, _toggle)
+            setup_dbus_trigger(config, lambda: _toggle("InputPlumber"))
         elif backend["trigger"] == "ally-m1":
-            w._prepare_hhd_trigger(lambda: setup_hhd_trigger(config, lambda: _toggle("M1")))
+            w._prepare_hhd_trigger(lambda: setup_hhd_trigger(config, lambda stamp: _toggle("M1", stamp)))
 
     # Direct triggers start only after our DBus service owns its name. HHD also needs
     # the pre-map Steam focus rules enabled before it can send its first Toggle.
-    setup_service(_show, _hide, _toggle, w.set_reported_geometry,
+    setup_service(lambda: _show(source="DBus Show"), lambda: _hide(source="DBus Hide"),
+                  lambda: _toggle("DBus Toggle"), w.set_reported_geometry,
                   lambda: w.on_move(None), lambda: w.on_reset(None), w.next_geometry,
-                  _setup_input_backend, _input_method, _steam_osk)
+                  _setup_input_backend, _input_method, _steam_osk, w._debug)
     if GAMEMODE:
-        setup_dbus_trigger(config, _toggle)
-    setup_hotkey(config, _toggle)         # optional evdev hotkey (attached kbd / Steam Input chord)
+        setup_dbus_trigger(config, lambda: _toggle("InputPlumber"))
+    setup_hotkey(config, lambda: _toggle("hotkey"))  # optional attached kbd / Steam Input chord
     setup_focus_trigger(config, _focus_show)  # optional: auto-show when a text field is focused
     setup_gesture(config, _focus_show)        # optional: swipe up from bottom edge to summon
 

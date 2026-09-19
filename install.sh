@@ -337,6 +337,9 @@ if command -v kwriteconfig6 >/dev/null 2>&1; then
   "${K[@]}" Description "Better Handheld Keyboard"
   "${K[@]}" wmclass "handheld-kbd";  "${K[@]}" wmclassmatch 1; "${K[@]}" wmclasscomplete false
   "${K[@]}" above true;            "${K[@]}" aboverule 2
+  # Keep-above shares Plasma's panel layer and sits below its popup menus. KWin's
+  # native OSD layer stays above both without activating the keyboard window.
+  "${K[@]}" layer osd;             "${K[@]}" layerrule 2
   "${K[@]}" acceptfocus false;     "${K[@]}" acceptfocusrule 2
   "${K[@]}" noborder true;         "${K[@]}" noborderrule 2
   "${K[@]}" skiptaskbar true;      "${K[@]}" skiptaskbarrule 2

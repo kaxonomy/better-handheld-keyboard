@@ -111,6 +111,8 @@ else:
     rules = json.loads(state.read_text())
     assert rules["Wayland"] == {"InputMethod": provider, "VirtualKeyboardEnabled": "true", "VirtualKeyboardMode": "1"}
     assert rules[RULE]["positionrule"] == rules[RULE]["sizerule"] == "0"
+    assert rules[RULE]["layer"] == "osd" and rules[RULE]["layerrule"] == "2"
+    assert rules[RULE]["acceptfocus"] == "false" and rules[RULE]["acceptfocusrule"] == "2"
     assert "position" not in rules[RULE] and "size" not in rules[RULE]
     for rule in STEAM_RULES:
         assert rules[rule]["acceptfocusrule"] == rules[rule]["opacityactiverule"] == "0"

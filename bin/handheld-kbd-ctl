@@ -183,6 +183,7 @@ for field in ("available", "enabled", "active", "visible"):
     print("Plasma virtual keyboard %s: %s" % (field, probe(["busctl", "--user", "get-property",
           "org.kde.KWin", "/VirtualKeyboard", "org.kde.kwin.VirtualKeyboard", field])))
 print("mirror setting: %s" % c.get("mirror", True))
+print("optional hotkey: %s" % c.get("hotkey", []))
 trigger = probe(["busctl", "--user", "call", "org.handheld.Keyboard", "/org/handheld/Keyboard",
                  "org.handheld.Keyboard", "GetTrigger"])
 script = os.path.expanduser("~/.local/share/kwin/scripts/handheld-kbd-opacity/contents/code/main.js")

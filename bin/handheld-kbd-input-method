@@ -52,6 +52,7 @@ class InputMethod:
         self.notify, self.failed, self.debug = notify, failed, debug
         self.panel_changed = panel_changed
         self.context = None
+        self.context_generation = 0
         self.method = None
         self.surface = None
         self.globals = {}
@@ -154,6 +155,7 @@ class InputMethod:
 
     def _activate(self, data, method, context):
         self.context = context
+        self.context_generation += 1
         # Strings remain opaque pointers: do not decode, retain, or log user text.
         self.context_listener = self._listen(context, [(lambda *_: None, args) for args in (
             (C.c_void_p, C.c_uint, C.c_uint), (), (C.c_uint, C.c_uint),
@@ -197,6 +199,7 @@ class InputMethod:
             self.listeners.remove(self.context_listener)
             self.surface = None
             self.context = None
+            self.context_generation += 1
             if self.debug:
                 print("handheld-kbd: Plasma text input deactivated", file=sys.stderr)
             self.notify(False)
@@ -219,7 +222,9 @@ def main():
         pass
     loop = GLib.MainLoop()
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-    state = {"active": False, "ready": False, "failed": False}
+    state = {"active": False, "ready": False, "failed": False,
+             "visibility_request": 0, "dismissed_context": None}
+    method = None
 
     def failed(message):
         print("handheld-kbd: " + message, file=sys.stderr)
@@ -247,21 +252,38 @@ def main():
     def vanished(*_):
         state["ready"] = False
 
-    def visibility_reply(conn, result):
+    def visibility_reply(conn, result, request, generation):
+        current = (request == state["visibility_request"] and method is not None
+                   and generation == method.context_generation)
         try:
             visible = conn.call_finish(result).unpack()[0]
-            notify(bool(visible and method.context))
         except GLib.Error as ex:
-            failed("could not read KWin panel visibility: " + str(ex))
+            if current:
+                failed("could not read KWin panel visibility: " + str(ex))
+            return
+        if not current or (visible and generation == state["dismissed_context"]):
+            return
+        notify(bool(visible and method.context))
 
     def visibility_changed(*_):
+        state["visibility_request"] += 1
+        request = state["visibility_request"]
+        # A panel's initial Wayland roundtrip may complete during construction.
+        # The explicit refresh after construction handles that initial context.
+        generation = method.context_generation if method is not None else None
         bus.call("org.kde.KWin", "/VirtualKeyboard", "org.freedesktop.DBus.Properties",
                  "Get", GLib.Variant("(ss)", ("org.kde.kwin.VirtualKeyboard", "visible")),
-                 GLib.VariantType.new("(v)"), Gio.DBusCallFlags.NONE, 2000, None, visibility_reply)
+                 GLib.VariantType.new("(v)"), Gio.DBusCallFlags.NONE, 2000, None,
+                 lambda conn, result: visibility_reply(conn, result, request, generation))
 
     def dismiss(conn, sender, path, interface, name, params, invocation):
         # End the context, not the configured provider. A subsequent tap can
         # activate the same text field again without disabling Plasma input.
+        # KWin's old panel stays visible until Wayland deactivation is dispatched;
+        # neither a queued Get reply nor a service restart may show it again.
+        state["visibility_request"] += 1
+        state["dismissed_context"] = method.context_generation
+        notify(False)
         bus.call("org.kde.KWin", "/VirtualKeyboard", "org.freedesktop.DBus.Properties",
                  "Set", GLib.Variant("(ssv)", ("org.kde.kwin.VirtualKeyboard", "active",
                                                GLib.Variant("b", False))), None,

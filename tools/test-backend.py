@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Hardware-free checks: python3 tools/test-backend.py."""
 import contextlib
+import ast
 import io
 import json
 import os
@@ -27,6 +28,10 @@ def bitmap(*keys):
         words.append(f"{value & ((1 << bits) - 1):x}")
         value >>= bits
     return " ".join(reversed(words))
+
+
+def input_event(kind, code, value, stamp=1.0):
+    return SimpleNamespace(type=kind, code=code, value=value, timestamp=lambda: stamp)
 
 
 class BackendTests(unittest.TestCase):
@@ -111,6 +116,131 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(press.feed(backend.EV_KEY, backend.KEY_F17, 1, 2.02))
         press.feed(backend.EV_KEY, backend.KEY_F17, 0, 2.03)
         self.assertTrue(press.feed(backend.EV_KEY, backend.KEY_F17, 1, 2.2))
+        press.feed(backend.EV_KEY, backend.KEY_F17, 0, 2.3)
+        self.assertTrue(press.feed(backend.EV_KEY, backend.KEY_F17, 1, 1))  # clock adjusted backwards
+
+
+class HotkeyTests(unittest.TestCase):
+    def test_m1_is_not_also_delivered_as_an_optional_hotkey(self):
+        source = Path(__file__).resolve().parents[1] / "bin/handheld-kbd.py"
+        function = next(node for node in ast.parse(source.read_text()).body
+                        if isinstance(node, ast.FunctionDef) and node.name == "setup_hotkey")
+        for codes, ready in ((["KEY_F17"], True), (["KEY_F17"], False),
+                             (["KEY_LEFTMETA", "KEY_F17"], True)):
+            watches, toggles = [], []
+            devices = {}
+            for path in ("/dev/input/ally", "/dev/input/external"):
+                devices[path] = SimpleNamespace(path=path, name=path, fd=path,
+                    capabilities=lambda: {1: [187, 125]}, read=lambda: iter([
+                        input_event(1, 125, 1), input_event(1, 187, 1),
+                        input_event(1, 187, 0), input_event(1, 125, 0)]))
+            scope = {"e": SimpleNamespace(EV_KEY=1, KEY_F17=187, KEY_LEFTMETA=125), "sys": sys,
+                     "GLib": SimpleNamespace(IO_IN=1, io_add_watch=lambda *args: watches.append(args))}
+            exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), scope)
+            with patch.dict(sys.modules, {"evdev": SimpleNamespace(InputDevice=devices.get,
+                                                                     list_devices=lambda: list(devices))}), \
+                 patch.object(backend, "hhd_trigger_ready", side_effect=lambda path: ready and path.endswith("ally")):
+                scope["setup_hotkey"]({"hotkey": codes}, lambda: toggles.append(True))
+                for fd, condition, callback, device in watches:
+                    callback(fd, condition, device)
+            # Only the direct listener's F17 is excluded. A separate keyboard,
+            # a chord, and systems without the direct listener retain hotkeys.
+            self.assertEqual(len(toggles), 1 if ready and codes == ["KEY_F17"] else 2)
+
+
+class ShortcutConflictTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(patch.stopall)
+        patch.dict(os.environ, {"HOME": self.temp.name}).start()
+        self.command = str(Path(self.temp.name) / ".local/bin/handheld-kbd-toggle")
+        Path(self.command).parent.mkdir(parents=True)
+        Path(self.command).touch()
+        self.component = "net.local.handheld-kbd-toggle.desktop"
+        self.f17 = 0x01000040
+        self.info = ["_launch", "Keyboard", self.component, "Keyboard", "default", "Default", [], []]
+        self.infos, self.calls = [self.info], []
+        self.keys = [([self.f17, 0, 0, 0],)]
+        self.commandline = self.command
+        self.apply = True
+        def call(service, path, interface, method, params, result_type, flags, timeout, cancellable):
+            self.assertEqual((service, path, interface),
+                             ("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel"))
+            self.calls.append((method, params))
+            if method == "globalShortcutsByKey":
+                self.assertEqual(params, ("((ai)(i))", (([self.f17, 0, 0, 0],), (0,))))
+                value = (self.infos,)
+            elif method == "shortcutKeys":
+                value = (self.keys,)
+            else:
+                self.assertEqual(method, "setForeignShortcutKeys")
+                self.assertEqual(params[0], "(asa(ai))")
+                if self.apply:
+                    self.keys = params[1][1]
+                value = ()
+            return SimpleNamespace(unpack=lambda: value)
+        self.bus = SimpleNamespace(call_sync=call)
+        gio = SimpleNamespace(BusType=SimpleNamespace(SESSION=0),
+                              DBusCallFlags=SimpleNamespace(NO_AUTO_START=1),
+                              bus_get_sync=lambda *_: self.bus,
+                              DesktopAppInfo=SimpleNamespace(new=lambda name:
+                                  SimpleNamespace(get_commandline=lambda: self.commandline)))
+        glib = SimpleNamespace(Variant=lambda signature, values: (signature, values))
+        self.gio, self.glib = gio, glib
+        patch.dict(sys.modules, {"gi.repository": SimpleNamespace(Gio=gio, GLib=glib)}).start()
+
+    def test_only_plain_f17_is_removed_and_other_sequences_survive(self):
+        retained = [([self.f17 | 0x02000000, 0, 0, 0],),  # Shift+F17
+                    ([self.f17 + 1, 0, 0, 0],),          # M2/F18
+                    ([self.f17, 65, 0, 0],)]            # multi-step F17, A
+        self.keys += retained
+        self.assertEqual(backend.resolve_m1_shortcut_conflicts(), [self.component])
+        self.assertEqual(self.keys, retained)
+        self.assertEqual([method for method, _ in self.calls],
+                         ["globalShortcutsByKey", "shortcutKeys", "setForeignShortcutKeys", "shortcutKeys"])
+        self.assertEqual(self.calls[2][1][1][0], [self.component, "_launch", "Keyboard", "Keyboard"])
+        self.assertEqual(backend.resolve_m1_shortcut_conflicts(), [])
+        self.assertEqual(sum(method == "setForeignShortcutKeys" for method, _ in self.calls), 1)
+
+    def test_canonical_home_path_explicit_toggle_and_nondefault_context(self):
+        alias = Path(self.temp.name) / "home-alias"
+        alias.symlink_to(self.temp.name, target_is_directory=True)
+        self.commandline = str(alias / ".local/bin/handheld-kbd-toggle") + " toggle"
+        self.info[4] = "custom"
+        self.keys = [([self.f17],)]  # accept unpadded QKeySequence too
+        self.assertEqual(backend.resolve_m1_shortcut_conflicts(), [self.component])
+        self.assertEqual(self.keys, [])
+        self.assertEqual(self.calls[2][1][1][0][0], self.component + "|custom")
+
+    def test_modern_glib_desktop_app_info_namespace(self):
+        unix = SimpleNamespace(DesktopAppInfo=self.gio.DesktopAppInfo)
+        del self.gio.DesktopAppInfo
+        with patch.dict(sys.modules, {"gi.repository": SimpleNamespace(Gio=self.gio, GLib=self.glib, GioUnix=unix)}):
+            self.assertEqual(backend.resolve_m1_shortcut_conflicts(), [self.component])
+        self.assertEqual(self.keys, [])
+
+    def test_other_commands_and_nonlaunch_actions_are_untouched(self):
+        for command in (self.command + " show", self.command + " hide", "/usr/bin/other",
+                        "/bin/sh -c " + self.command, '"unterminated'):
+            self.commandline = command
+            self.assertEqual(backend.resolve_m1_shortcut_conflicts(), [])
+        self.commandline = self.command
+        self.info[0] = "custom-action"
+        self.assertEqual(backend.resolve_m1_shortcut_conflicts(), [])
+        self.info[0], self.info[2] = "_launch", "kwin"
+        self.assertEqual(backend.resolve_m1_shortcut_conflicts(), [])
+        self.infos = []
+        self.assertEqual(backend.resolve_m1_shortcut_conflicts(), [])
+        self.assertTrue(all(method == "globalShortcutsByKey" for method, _ in self.calls))
+
+    def test_absent_api_and_failed_readback_are_reported(self):
+        with patch.object(self.bus, "call_sync", side_effect=RuntimeError("service unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "service unavailable"):
+                backend.resolve_m1_shortcut_conflicts()
+        self.apply = False
+        with self.assertRaisesRegex(RuntimeError, "did not take effect"):
+            backend.resolve_m1_shortcut_conflicts()
 
 
 class DeviceTests(unittest.TestCase):
@@ -155,6 +285,7 @@ class DeviceTests(unittest.TestCase):
 
     def trigger(self):
         candidate_fn = backend.ally_devices
+        self.shortcut_cleanup = patch.object(backend, "resolve_m1_shortcut_conflicts", return_value=[]).start()
         patch.object(backend, "ally_devices", side_effect=lambda dmi: candidate_fn(dmi, self.sysfs, self.devroot)).start()
         self.calls, self.opened, self.removed, self.watches = [], [], [], []
         self.active = []
@@ -177,7 +308,7 @@ class DeviceTests(unittest.TestCase):
             io_add_watch=lambda *args: self.watches.append(args) or 1, timeout_add_seconds=lambda *args: 2,
             source_remove=self.removed.append)
         with contextlib.redirect_stderr(io.StringIO()):
-            return backend.AllyM1Trigger({"dmi": DMI}, {}, self.glib, Device, lambda: self.calls.append("Toggle"))
+            return backend.AllyM1Trigger({"dmi": DMI}, {}, self.glib, Device, lambda *args: self.calls.append("Toggle"))
 
     def test_disconnect_reconnect_and_reused_event_number(self):
         first = self.device("event5")
@@ -206,18 +337,65 @@ class DeviceTests(unittest.TestCase):
         self.assertTrue(old.closed)
         self.assertIsNot(old, trigger.device)
 
+    def test_shortcut_cleanup_requires_successful_open_and_runs_on_reconnect(self):
+        trigger = self.trigger()
+        self.shortcut_cleanup.assert_not_called()
+        self.device("event5")
+        with patch.object(self.device_class, "__init__", side_effect=PermissionError("input permission")), \
+             contextlib.redirect_stderr(io.StringIO()):
+            trigger.rescan()
+        self.shortcut_cleanup.assert_not_called()
+        with contextlib.redirect_stderr(io.StringIO()):
+            trigger.rescan()
+            trigger.rescan()
+        self.shortcut_cleanup.assert_called_once_with()
+        with contextlib.redirect_stderr(io.StringIO()):
+            trigger.disconnect()
+            trigger.rescan()
+        self.assertEqual(self.shortcut_cleanup.call_count, 2)
+
+    def test_shortcut_api_failure_does_not_disable_m1(self):
+        trigger = self.trigger()
+        self.device("event5")
+        self.shortcut_cleanup.side_effect = RuntimeError("service unavailable")
+        with contextlib.redirect_stderr(io.StringIO()) as log:
+            trigger.rescan()
+        self.assertIn("could not check/remove duplicate Plasma F17", log.getvalue())
+        self.assertIn("service unavailable", log.getvalue())
+        self.assertIsNotNone(trigger.device)
+        self.assertTrue(backend.read_runtime_status()["ready"])
+
     def test_events_toggle_only_m1_and_never_write(self):
         self.device("event5")
         self.device("event6", vendor="1234")
         trigger = self.trigger()
         self.assertEqual(len(self.opened), 1)
-        event = lambda kind, code, value: SimpleNamespace(type=kind, code=code, value=value)
+        event = input_event
         trigger.device.events = [event(1, 188, 1), event(1, 187, 1), event(1, 187, 2), event(1, 187, 1)]
         trigger.on_input(42, 1)
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.calls[0], "Toggle")
         self.assertEqual(self.watches[0][1], self.glib.PRIORITY_HIGH)
         # Fake evdev has no write, grab, or uinput methods: passively reading is enough.
+
+    def test_slow_show_cannot_turn_queued_bounce_into_two_presses(self):
+        self.device("event5")
+        trigger = self.trigger()
+        trigger.device.events = [input_event(1, 187, 1, 1), input_event(1, 187, 0, 1.01),
+                                 input_event(1, 187, 1, 1.02), input_event(1, 187, 0, 1.03)]
+        # Placement can block the GLib loop after the first accepted press.
+        with patch.object(backend.time, "monotonic", side_effect=[1, 1.3, 1.31, 1.32]):
+            trigger.on_input(42, 1)
+        self.assertEqual(self.calls, ["Toggle"])
+
+    def test_separate_presses_buffered_during_busy_loop_are_both_delivered(self):
+        self.device("event5")
+        trigger = self.trigger()
+        trigger.device.events = [input_event(1, 187, 1, 1), input_event(1, 187, 0, 1.1),
+                                 input_event(1, 187, 1, 2), input_event(1, 187, 0, 2.1)]
+        with patch.object(backend.time, "monotonic", return_value=3):
+            trigger.on_input(42, 1)
+        self.assertEqual(self.calls, ["Toggle", "Toggle"])
 
     def test_device_identity_rechecked_after_open(self):
         self.device("event5")
@@ -240,9 +418,9 @@ class DeviceTests(unittest.TestCase):
         self.addCleanup(os.close, read_fd)
         self.addCleanup(os.close, write_fd)
         trigger.device.read = lambda: os.read(read_fd, 1) and iter([
-            SimpleNamespace(type=1, code=187, value=1)])
+            input_event(1, 187, 1)])
         order = []
-        trigger.toggle = lambda: order.append("M1")
+        trigger.toggle = lambda *args: order.append("M1")
         # Queue the native notification first, then make the evdev source ready.
         # Their callbacks are in the same batch; M1 must claim visibility first.
         GLib.idle_add(lambda: order.append("native") or False, priority=GLib.PRIORITY_DEFAULT)
@@ -263,7 +441,7 @@ class DeviceTests(unittest.TestCase):
             trigger.disconnect()
             self.active = [187]
             trigger.rescan()
-        event = lambda value: SimpleNamespace(type=1, code=187, value=value)
+        event = lambda value: input_event(1, 187, value)
         trigger.device.events = [event(1), event(2)]
         trigger.on_input(42, 1)
         self.assertEqual(self.calls, [])
@@ -274,7 +452,7 @@ class DeviceTests(unittest.TestCase):
     def test_dropped_events_resynchronize_without_phantom_toggle(self):
         self.device("event5")
         trigger = self.trigger()
-        event = lambda kind, code, value: SimpleNamespace(type=kind, code=code, value=value)
+        event = input_event
         self.active = [187]
         trigger.device.events = [event(0, 3, 0), event(1, 187, 1), event(0, 0, 0), event(1, 187, 1)]
         trigger.on_input(42, 1)

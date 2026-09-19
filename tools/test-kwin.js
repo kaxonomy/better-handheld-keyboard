@@ -132,7 +132,24 @@ try {
     assert.equal(kbd.frameGeometry.x, -860.5);
     assert.equal(run().timers.length, 0, 'locked mode must not poll');
     assert(!('activeWindow' in movement.context.workspace), 'helper must never activate a window');
-    console.log('KWin tests passed: OSK matching, mirror/HHD suppression, diagnostics, docking, custom placement, movement.');
+
+    const foreground = window({resourceClass: 'firefox', fullScreen: true, layer: 5, keepBelow: false});
+    const launcher = window({resourceClass: 'plasmashell', layer: 6, keepAbove: true});
+    const osdKbd = window({resourceClass: 'handheld-kbd', layer: 8, keepAbove: true});
+    const stacking = run({}, [], [foreground, launcher, osdKbd]);
+    assert.equal(foreground.keepBelow, false, 'native OSD layer needs no fullscreen demotion');
+    assert.equal(launcher.layer, 6, 'the launcher layer must remain unchanged');
+    assert(!('activeWindow' in stacking.context.workspace), 'stacking must not take keyboard focus');
+    assert.equal(stacking.context.windowMetadata(osdKbd).layer, '8');
+    assert.equal(stacking.context.windowMetadata(osdKbd).keepAbove, 'true');
+
+    const oldKbd = window({resourceClass: 'handheld-kbd', layer: 3});
+    const oldStacking = run({}, [], [foreground, oldKbd]);
+    assert.equal(foreground.keepBelow, true, 'old rules must retain the fullscreen fallback');
+    oldKbd.layer = 8;
+    oldStacking.context.applyStack();
+    assert.equal(foreground.keepBelow, false, 'native elevation must restore previous fullscreen demotion');
+    console.log('KWin tests passed: OSK matching, mirror/HHD suppression, diagnostics, docking, custom placement, movement, stacking.');
 } finally {
     fs.rmSync(home, {recursive: true, force: true});
 }

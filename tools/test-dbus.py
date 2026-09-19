@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise DBus CLI marshalling with no qdbus executable or desktop session."""
 from contextlib import redirect_stdout, redirect_stderr
+import ast
 import io
 import os
 from pathlib import Path
@@ -171,6 +172,76 @@ def integration():
                 assert result.stdout == expected, (args, result.stdout, expected)
             assert received[0] == ("loadScript", ("/tmp/script with spaces.js", "keyboard"))
             print("dbus: real Gio/private bus calls and Properties.Get/Set passed")
+
+            # Public controls remain independent of Steam mirror arbitration.
+            source = Path(__file__).resolve().parents[1] / "bin/handheld-kbd.py"
+            nodes = [node for node in ast.parse(source.read_text()).body if
+                     (isinstance(node, ast.FunctionDef) and node.name == "setup_service") or
+                     (isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "SERVICE_XML" for t in node.targets))]
+            scope = {"GLib": GLib, "_service_keepalive": [], "sys": sys}
+            exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
+            manual, mirrored, debug = [], [], []
+            ready = threading.Event()
+            scope["setup_service"](lambda: manual.append("Show"), lambda: manual.append("Hide"),
+                                   lambda: manual.append("Toggle"), ready=ready.set,
+                                   steam_osk=mirrored.append, debug=debug.append)
+            assert ready.wait(5), "keyboard service did not acquire its name"
+            for action in ("Show", "Hide", "Toggle"):
+                bus.call_sync("org.handheld.Keyboard", "/org/handheld/Keyboard", "org.handheld.Keyboard",
+                              "SteamOsk", GLib.Variant("(s)", (action,)), None, Gio.DBusCallFlags.NONE, 2000, None)
+                result = subprocess.run(command[:-1] + ["org.handheld.Keyboard", "/org/handheld/Keyboard", action],
+                                        capture_output=True, text=True, timeout=5)
+                assert result.returncode == 0, result.stderr
+            assert mirrored == ["Show", "Hide", "Toggle"], mirrored
+            assert manual == ["Show", "Hide", "Toggle"], manual
+            assert len(debug) == 6 and all("received from :" in entry for entry in debug), debug
+            for owner in scope["_service_keepalive"]:
+                Gio.bus_unown_name(owner)
+            print("dbus: Steam mirror and public keyboard controls, source logging passed")
+
+            # Reproduce the user's Plasma desktop shortcut launching a second
+            # toggle. Exercise the real Gio variants, XDG desktop lookup and the
+            # supported KGlobalAccel API, without changing the host's shortcuts.
+            bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                          "RequestName", GLib.Variant("(su)", ("org.kde.kglobalaccel", 0)), None,
+                          Gio.DBusCallFlags.NONE, 1000, None)
+            accelerator = Gio.DBusNodeInfo.new_for_xml('''<node><interface name="org.kde.KGlobalAccel">
+              <method name="globalShortcutsByKey"><arg type="(ai)"/><arg type="(i)"/>
+                <arg type="a(ssssssaiai)" direction="out"/></method>
+              <method name="shortcutKeys"><arg type="as"/><arg type="a(ai)" direction="out"/></method>
+              <method name="setForeignShortcutKeys"><arg type="as"/><arg type="a(ai)"/></method>
+            </interface></node>''')
+            f17 = 16777280
+            sequences = [([f17, 0, 0, 0],), ([f17 + 1, 0, 0, 0],), ([65, 66, 0, 0],)]
+            component = "net.local.handheld-kbd-toggle.desktop"
+            def shortcut_call(conn, sender, path, iface, name, params, invocation):
+                if name == "globalShortcutsByKey":
+                    assert params.unpack() == (([f17, 0, 0, 0],), (0,))
+                    value = ("a(ssssssaiai)", [("_launch", "Launch", component, "Keyboard", "default", "Default", [f17], [])])
+                elif name == "shortcutKeys":
+                    value = ("a(ai)", sequences)
+                else:
+                    sequences[:] = params.unpack()[1]
+                    value = None
+                invocation.return_value(GLib.Variant("(" + value[0] + ")", (value[1],)) if value else None)
+            bus.register_object("/kglobalaccel", accelerator.interfaces[0], shortcut_call, None, None)
+            data = Path(directory) / ".local/share"
+            apps = data / "applications"
+            apps.mkdir(parents=True)
+            target = Path(directory) / ".local/bin/handheld-kbd-toggle"
+            target.parent.mkdir(parents=True)
+            target.write_text("#!/bin/sh\nexit 0\n")
+            target.chmod(0o755)
+            desktop = apps / component
+            desktop.write_text("[Desktop Entry]\nType=Application\nName=Keyboard\nExec=" + str(target) + "\n")
+            before = desktop.read_bytes()
+            sys.path.insert(0, str(source.parent))
+            import handheld_kbd_backend as backend
+            with patch.dict(os.environ, {"HOME": directory, "XDG_DATA_HOME": str(data)}):
+                assert backend.resolve_m1_shortcut_conflicts() == [component]
+            assert sequences == [([f17 + 1, 0, 0, 0],), ([65, 66, 0, 0],)], sequences
+            assert desktop.read_bytes() == before
+            print("dbus: real KGlobalAccel F17 migration preserves M2, multistep shortcut and desktop entry")
         finally:
             if loop:
                 loop.quit()

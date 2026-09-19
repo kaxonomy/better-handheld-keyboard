@@ -117,7 +117,10 @@ shortcut device without grabbing it or emitting any keys. HHD remains unchanged.
 A narrow KWin rule prevents known Steam OSK windows from taking focus or flashing;
 the KWin helper identifies and closes them using Steam identity and keyboard
 metadata. Mirror toggles are disabled while the direct M1 listener is ready, so
-the same press cannot toggle twice. Device discovery repeats after disconnects.
+the Steam notification does not repeat the direct toggle. Device discovery repeats
+after disconnects. The helper's 700ms duplicate-window guard also covers a
+disconnect immediately after M1; mirror fallback then resumes if the device
+remains unavailable.
 This follows HHD's [Ally driver](https://github.com/hhd-dev/hhd/blob/master/src/hhd/device/rog_ally/base.py)
 and [paddle actions](https://github.com/hhd-dev/hhd/blob/master/src/hhd/controller/base.py);
 no HHD configuration or system files are changed.
@@ -136,6 +139,31 @@ Tap activation requires the application to support Wayland text input. M1 and
 the usual toggle shortcut remain available in applications that do not. Closing
 an automatically opened keyboard allows another tap to open it again. A change
 of text-field focus does not hide a keyboard opened manually with M1.
+
+The M1 visibility path is:
+
+1. The ASUS listener filters F17 press/release/repeat events using their kernel
+   timestamps. A busy GTK loop cannot turn queued contact bounce into two presses.
+   An optional F17 hotkey ignores that same device while the direct listener owns it.
+   Once that listener opens successfully, a duplicate Plasma F17 shortcut running
+   `handheld-kbd-toggle` is removed through KGlobalAccel. This prevents the direct
+   press and the launched command toggling twice. The desktop entry, other key
+   combinations and M2 remain unchanged; the migration is logged. It uses KDE's
+   [shortcut API](https://github.com/KDE/kglobalaccel/blob/v6.22.0/src/org.kde.KGlobalAccel.xml).
+2. The accepted press reaches the shared toggle handler directly. If a native
+   tap-show overtook the physical event, M1 takes ownership of that show; a keyboard
+   already open before the press still closes normally.
+3. HHD may independently open Steam's OSK. KWin suppresses/closes it, and its
+   mirror request uses the direct-trigger guard described above.
+4. Plasma visibility replies belong to a particular text-input context and query.
+   Superseded replies cannot reopen a dismissed keyboard or hide a new context.
+   Deferred hides are cancelled when a newer show takes ownership.
+
+On current Plasma 6, the keyboard's KWin rule uses the OSD layer, above the
+Application Launcher and fullscreen windows, while keeping focus disabled. It
+remains an ordinary window for screen-lock protection. `handheld-kbd-ctl windows`
+reports its layer (8 on KWin 6.6) as well as its geometry. This uses KWin's native
+[layer rule](https://github.com/KDE/kwin/blob/v6.6.4/src/rulesettings.kcfg).
 
 The nonexclusive listener does not consume the original hardware F17 event. It
 never re-injects F17, and does not watch F17 on unrelated keyboards. Avoid binding
@@ -171,6 +199,9 @@ handheld-kbd-ctl status
 handheld-kbd-ctl windows
 ```
 
+Log out and back in to reload an updated Plasma tap provider; `restart` reloads
+the keyboard and its supervisor.
+
 If you specifically need to remove a stale official installation first, run
 `./uninstall.sh` from this checkout, then `./install.sh`. Uninstall preserves
 `~/.config/handheld-kbd/` but removes the uinput rule, so reinstall may ask for a
@@ -186,6 +217,10 @@ journalctl --user -f | grep HHKBD
 # Turn detailed logging off afterwards:
 handheld-kbd-ctl set debug false bool
 ```
+
+Debug entries include the process ID, timestamp, M1 event timestamp/value,
+DBus sender and request source, and the committed visibility. They distinguish
+M1, Steam mirror, DBus controls, hotkeys, InputPlumber, and Plasma automatic hides.
 
 `status` / `diagnostics` reports the backend, DMI, session, service readiness,
 selected M1 device, placement and live Steam window metadata without root. It

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -157,6 +158,58 @@ def ally_devices(dmi, sysfs="/sys/class/input", devroot="/dev/input"):
     return devices
 
 
+def resolve_m1_shortcut_conflicts():
+    """Retire only duplicate plain-F17 launch shortcuts for our toggle command."""
+    from gi.repository import Gio, GLib
+    try:
+        from gi.repository import GioUnix
+    except ImportError:
+        GioUnix = Gio                  # DesktopAppInfo lived in Gio on older GLib
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    def call(method, signature, values):
+        return bus.call_sync("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel",
+                             method, GLib.Variant(signature, values), None,
+                             Gio.DBusCallFlags.NO_AUTO_START, 2000, None).unpack()
+
+    # Qt::Key_F17, not Linux's evdev code. Use the v2 API so other multi-step
+    # shortcuts survive; the deprecated integer API loses their later strokes.
+    f17 = 0x01000040
+    shortcuts = call("globalShortcutsByKey", "((ai)(i))", (([f17, 0, 0, 0],), (0,)))[0]
+    expected = os.path.realpath(os.path.expanduser("~/.local/bin/handheld-kbd-toggle"))
+    changed = []
+    for info in shortcuts:
+        action, title, component, friendly, context = info[:5]
+        if action != "_launch" or not component.endswith(".desktop"):
+            continue
+        desktop = GioUnix.DesktopAppInfo.new(component)
+        if desktop is None:
+            continue
+        try:
+            argv = shlex.split(desktop.get_commandline() or "")
+        except ValueError:
+            continue
+        if not argv or argv[1:] not in ([], ["toggle"]):
+            continue
+        executable = argv[0] if os.path.isabs(argv[0]) else shutil.which(argv[0])
+        if not executable or os.path.realpath(executable) != expected:
+            continue
+        action_id = [component + ("|" + context if context and context != "default" else ""),
+                     action, friendly, title]
+        keys = call("shortcutKeys", "(as)", (action_id,))[0]
+        retained = [key for key in keys if not (1 <= len(key[0]) <= 4
+                    and key[0][0] == f17 and not any(key[0][1:]))]
+        if len(retained) == len(keys):
+            continue
+        # This is KGlobalAccel's supported foreign-action edit: NoAutoloading,
+        # persistent settings, and notification to the owning component.
+        call("setForeignShortcutKeys", "(asa(ai))", (action_id, retained))
+        actual = call("shortcutKeys", "(as)", (action_id,))[0]
+        if {tuple(key[0]) for key in actual} != {tuple(key[0]) for key in retained}:
+            raise RuntimeError("Plasma F17 shortcut change did not take effect for " + component)
+        changed.append(component)
+    return changed
+
+
 class M1Press:
     """One toggle per press; ignore autorepeat and contact bounce."""
     def __init__(self):
@@ -170,7 +223,7 @@ class M1Press:
             self.down = False
         elif value == 1 and not self.down:
             self.down = True
-            if now - self.last >= 0.08:
+            if now < self.last or now - self.last >= 0.08:
                 self.last = now
                 return True
         return False
@@ -206,7 +259,7 @@ class AllyM1Trigger:
 
     def _log(self, message, debug=False):
         if not debug or self.debug:
-            print("handheld-kbd: " + message, file=sys.stderr)
+            print(f"handheld-kbd: {time.time():.6f} pid={os.getpid()} {message}", file=sys.stderr)
 
     def _status(self):
         status = {"pid": os.getpid(), "backend": "hhd", "trigger": "ally-m1",
@@ -263,6 +316,12 @@ class AllyM1Trigger:
                 # notifications from the same press can change visibility.
                 self.watch = self.glib.io_add_watch(device.fd, self.glib.PRIORITY_HIGH,
                     self.glib.IO_IN | self.glib.IO_HUP | self.glib.IO_ERR, self.on_input)
+                try:
+                    for component in resolve_m1_shortcut_conflicts():
+                        self._log("Removed duplicate Plasma F17 toggle shortcut from " + component
+                                  + "; direct M1 handles it, other shortcuts unchanged")
+                except Exception as ex:
+                    self._log(f"could not check/remove duplicate Plasma F17 toggle shortcuts ({ex})")
                 self.error = ""
                 self._status()
                 self._log(f"M1 listening on {device.path} ({device.name}), KEY_F17; HHD M2 unchanged")
@@ -293,13 +352,21 @@ class AllyM1Trigger:
                     if event.type == EV_SYN and event.code == SYN_REPORT:
                         self.press.down = KEY_F17 in self.device.active_keys()
                         self.dropped = False
-                elif self.press.feed(event.type, event.code, event.value, time.monotonic()):
-                    self._log("M1 event received; toggle requested", debug=True)
+                elif event.type == EV_KEY and event.code == KEY_F17:
+                    # evdev's default clock is CLOCK_REALTIME. Callback time is
+                    # wrong here: showing the window can block while bounce or
+                    # later genuine presses are already queued in the kernel.
+                    stamp = event.timestamp()
+                    accepted = self.press.feed(event.type, event.code, event.value, stamp)
+                    self._log(f"M1 event value={event.value} time={stamp:.6f} "
+                              f"{'accepted; toggle requested' if accepted else 'ignored'}", debug=True)
+                    if not accepted:
+                        continue
                     # This listener runs in the keyboard's own GLib loop. Calling
                     # its Toggle handler now avoids a self-DBus round trip during
                     # which Plasma could show the keyboard automatically first.
                     try:
-                        self.toggle()
+                        self.toggle(stamp)
                     except Exception as ex:
                         self._log(f"M1 toggle failed ({ex})")
         except BlockingIOError:
@@ -311,8 +378,9 @@ class AllyM1Trigger:
         return True
 
 
-def hhd_trigger_ready():
-    return any(trigger.device is not None for trigger in _keepalive)
+def hhd_trigger_ready(device_path=None):
+    return any(trigger.device is not None and (device_path is None or trigger.device.path == device_path)
+               for trigger in _keepalive)
 
 
 def setup_hhd_trigger(config, toggle):

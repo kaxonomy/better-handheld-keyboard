@@ -173,7 +173,7 @@ function isSteamOsk(w){
 }
 function windowMetadata(w){
     var result = {};
-    ["resourceClass", "resourceName", "desktopFileName", "windowRole", "internalId", "pid"].forEach(function(key){
+    ["resourceClass", "resourceName", "desktopFileName", "windowRole", "internalId", "pid", "layer", "keepAbove"].forEach(function(key){
         result[key] = textProp(w, key);
     });
     // Ordinary Steam titles can include chat or browser text. Only identified OSK
@@ -199,11 +199,11 @@ function setOp(w){
 
 // GTK hide() destroys the OSK's Wayland surface, so a present, non-minimized
 // handheld-kbd window means the keyboard is currently shown.
-function kbdShown(){
+function shownKbd(){
     var list = workspace.windowList();
     for (var i = 0; i < list.length; i++)
-        if (isKbd(list[i]) && !list[i].minimized) return true;
-    return false;
+        if (isKbd(list[i]) && !list[i].minimized) return list[i];
+    return null;
 }
 
 // A fullscreen window sits in KWin's ActiveLayer, above the OSK's keep-above
@@ -213,13 +213,17 @@ function kbdShown(){
 function applyStack(){
     if (!FULLSCREEN_LIFT) return;
     try {
-        var shown = kbdShown();
+        var kbd = shownKbd();
+        // The installed layer=osd rule puts us in KWin's OnScreenDisplayLayer (8),
+        // above popups and fullscreen. Only old installations need the fallback.
+        // KWin still excludes ordinary windows from the locked screen in any layer.
+        var needsLift = kbd && !(typeof kbd.layer === "number" && kbd.layer >= 8);
         var list = workspace.windowList();
         for (var i = 0; i < list.length; i++){
             var w = list[i];
             if (isKbd(w)) continue;
             var id = "" + w.internalId;
-            if (shown && w.fullScreen){
+            if (needsLift && w.fullScreen){
                 if (!w.keepBelow){ w.keepBelow = true; demoted[id] = true; }
             } else if (demoted[id]){
                 w.keepBelow = false;
