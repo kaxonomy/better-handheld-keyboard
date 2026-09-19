@@ -211,13 +211,14 @@ def integration():
               <method name="shortcutKeys"><arg type="as"/><arg type="a(ai)" direction="out"/></method>
               <method name="setForeignShortcutKeys"><arg type="as"/><arg type="a(ai)"/></method>
             </interface></node>''')
-            f17 = 16777280
-            sequences = [([f17, 0, 0, 0],), ([f17 + 1, 0, 0, 0],), ([65, 66, 0, 0],)]
+            launch8, f17 = 16777386, 16777280
+            sequences = [([launch8, 0, 0, 0],), ([launch8 + 1, 0, 0, 0],),
+                         ([f17, 0, 0, 0],), ([65, 66, 0, 0],)]
             component = "net.local.handheld-kbd-toggle.desktop"
             def shortcut_call(conn, sender, path, iface, name, params, invocation):
                 if name == "globalShortcutsByKey":
-                    assert params.unpack() == (([f17, 0, 0, 0],), (0,))
-                    value = ("a(ssssssaiai)", [("_launch", "Launch", component, "Keyboard", "default", "Default", [f17], [])])
+                    assert params.unpack() == (([launch8, 0, 0, 0],), (0,))
+                    value = ("a(ssssssaiai)", [("_launch", "Launch", component, "Keyboard", "default", "Default", [launch8], [])])
                 elif name == "shortcutKeys":
                     value = ("a(ai)", sequences)
                 else:
@@ -238,10 +239,10 @@ def integration():
             sys.path.insert(0, str(source.parent))
             import handheld_kbd_backend as backend
             with patch.dict(os.environ, {"HOME": directory, "XDG_DATA_HOME": str(data)}):
-                assert backend.resolve_m1_shortcut_conflicts() == [component]
-            assert sequences == [([f17 + 1, 0, 0, 0],), ([65, 66, 0, 0],)], sequences
+                assert backend.resolve_m1_shortcut_conflicts({launch8: "Launch8"}) == [component]
+            assert sequences == [([launch8 + 1, 0, 0, 0],), ([f17, 0, 0, 0],), ([65, 66, 0, 0],)], sequences
             assert desktop.read_bytes() == before
-            print("dbus: real KGlobalAccel F17 migration preserves M2, multistep shortcut and desktop entry")
+            print("dbus: real Gio KGlobalAccel Launch8 migration preserves M2, F17, multistep shortcut and desktop entry")
         finally:
             if loop:
                 loop.quit()

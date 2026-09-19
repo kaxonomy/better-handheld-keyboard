@@ -4,6 +4,7 @@ import ast
 from contextlib import redirect_stderr
 import io
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -28,7 +29,7 @@ for node in tree.body:
         node.bases = []
         node.body = [m for m in node.body if isinstance(m, ast.FunctionDef) and m.name in methods]
         nodes.append(node)
-scope = {"DBUS": str(source.with_name("handheld-kbd-dbus")), "json": json, "os": os, "sys": sys, "time": time,
+scope = {"DBUS": str(source.with_name("handheld-kbd-dbus")), "json": json, "math": math, "os": os, "sys": sys, "time": time,
          "Gtk": SimpleNamespace(EventSequenceState=SimpleNamespace(CLAIMED=1))}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
 OSK = scope["OSK"]
@@ -104,7 +105,7 @@ with tempfile.TemporaryDirectory() as config_dir:
     w.request_geometry = lambda: snapshots.append(True)
     w.unlocked = True
     w.cfg["position_mode"] = "bottom"
-    final = {"x": -600, "y": 110, "w": 660, "h": 330}
+    final = {"x": -600.8, "y": 110.4, "w": 660, "h": 327.2}
     w._pending_geometry = final
     def hide():
         saved = json.loads(Path(config_dir, "config.json").read_text())
@@ -115,16 +116,19 @@ with tempfile.TemporaryDirectory() as config_dir:
     assert callbacks[0]() is True and not snapshots  # move still queued
     assert callbacks[1]() is True and not hidden
     assert json.loads(w.next_geometry()) == final
-    w.set_reported_geometry("-600,110,660,330")
+    w.set_reported_geometry("-600.8,110.4,660,327.2")
     assert callbacks[0]() is False and snapshots == [True]
     assert callbacks[1]() is True and not hidden  # ordinary report is not the snapshot
-    w.set_reported_geometry("final:-600,110,660,330")
+    w.set_reported_geometry("final:-600.8,110.4,660,327.2")
     w._geometry_changed_at = time.monotonic() - 1
     assert callbacks[1]() is False and hidden == [True]
     assert callbacks[1]() is False and hidden == [True]  # stale timers cannot hide twice
     restored = scope["_deep_merge"](scope["DEFAULT_CONFIG"], json.loads(Path(config_dir, "config.json").read_text()))
     w.cfg = restored
     assert w._slot_rect(restored["geometry"], False) == final
+    for invalid in ("nan,110,660,327.2", "-600,inf,660,327.2", "-600,110,660,-inf"):
+        w.set_reported_geometry(invalid)
+        assert w.reported_rect == final
     w.finish_movement(lambda: hidden.append(True))
     assert hidden == [True, True]  # a normal hide has no geometry delay
 

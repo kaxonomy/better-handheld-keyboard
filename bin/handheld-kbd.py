@@ -695,7 +695,7 @@ class OSK(Gtk.Window):
         self.set_focus_on_map(False)
         self.set_keep_above(True)
         g = config["geometry"]
-        self.set_default_size(g["w"], g["h"])
+        self.set_default_size(round(g["w"]), round(g["h"]))
         self.set_gravity(Gdk.Gravity.SOUTH)
         self.apply_locale(locale)
         self.apply_size()          # sync grid fill + window/rule geometry to self.big
@@ -1303,7 +1303,7 @@ class OSK(Gtk.Window):
                     cw = int(base_w * cw_scale)
                 else:
                     cw = -1
-                child.set_size_request(cw, kh)
+                child.set_size_request(cw, int(kh))
         if self.size_btn:
             self._set_label(self.size_btn, {0: "1×", 1: "2×", 2: "3×", 3: "4×"}[self.size_level], "")
         # Window geometry. Game Mode is a fullscreen gamescope overlay (keys docked at
@@ -1316,7 +1316,7 @@ class OSK(Gtk.Window):
         # The initial size is only a GTK hint. Once mapped, KWin owns the geometry;
         # client resize requests would race the compositor during a drag or restore.
         if not self.get_realized():
-            self.set_default_size(rect["w"], rect["h"])
+            self.set_default_size(round(rect["w"]), round(rect["h"]))
         # The KWin script is the only thing that positions the window — in both docked and
         # custom modes. A window rule doing it too meant two authorities re-asserting
         # different rects, which is why a dragged keyboard jumped back a second later.
@@ -1436,7 +1436,9 @@ class OSK(Gtk.Window):
         if final:
             rect = rect[6:]
         try:
-            x, y, w, h = (int(round(float(v))) for v in rect.split(","))
+            x, y, w, h = (float(v) for v in rect.split(","))
+            if not all(math.isfinite(v) for v in (x, y, w, h)):
+                raise ValueError("non-finite geometry")
         except (ValueError, TypeError):
             self._debug("invalid geometry report from KWin")
             return

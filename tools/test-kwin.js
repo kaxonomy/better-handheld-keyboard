@@ -16,11 +16,48 @@ function signal() {
 }
 let serial = 0;
 function window(properties = {}) {
-    return Object.assign({internalId: ++serial, resourceClass: '', caption: '',
+    const w = Object.assign({internalId: ++serial, resourceClass: '', caption: '',
         frameGeometry: {x: 0, y: 0, width: 400, height: 200},
         frameGeometryChanged: signal(), captionChanged: signal(), desktopFileNameChanged: signal(),
         fullScreenChanged: signal(), minimizedChanged: signal(),
         closeWindow() { this.closed = true; }}, properties);
+    let geometry = w.frameGeometry;
+    Object.defineProperty(w, 'frameGeometry', {
+        configurable: true,
+        get() { return {...geometry}; },
+        set(rect) {
+            const previous = geometry;
+            geometry = {...rect};
+            if (['x', 'y', 'width', 'height'].some(key => previous[key] !== geometry[key]))
+                this.frameGeometryChanged.emit(previous);
+        }
+    });
+    return w;
+}
+function waylandWindow(geometry, minimumHeight = 0, scale = 1.25) {
+    const w = window({resourceClass: 'handheld-kbd', minSize: {width: 320, height: minimumHeight}});
+    let actual = {...geometry};
+    w.requests = [];
+    w.pending = null;
+    w.commit = function(rect = this.pending) {
+        this.pending = null;
+        const previous = actual;
+        actual = {...rect, height: Math.round(Math.max(rect.height, minimumHeight) * scale) / scale};
+        if (['x', 'y', 'width', 'height'].some(key => previous[key] !== actual[key]))
+            this.frameGeometryChanged.emit(previous);
+    };
+    Object.defineProperty(w, 'frameGeometry', {
+        get() { return {...actual}; },
+        set(rect) {
+            this.requests.push({...rect});
+            if (rect.width !== actual.width || rect.height !== actual.height) {
+                this.pending = {...rect}; // a configure request does not change the current frame
+            } else if (rect.x !== actual.x || rect.y !== actual.y) {
+                this.commit(rect);
+            }
+        }
+    });
+    return w;
 }
 function run(config = {}, args = [], windows = []) {
     fs.writeFileSync(path.join(home, '.config/handheld-kbd/config.json'), JSON.stringify(config));
@@ -70,19 +107,66 @@ try {
     const custom = run({position_mode: 'custom', dock_bottom_margin: 80, geometry: {x: -950, y: 120, w: 700, h: 350}});
     const moved = window({resourceClass: 'handheld-kbd'});
     custom.add(moved);
-    assert.deepEqual(moved.frameGeometry, {x: -950, y: 120, width: 700, height: 350});
-    moved.frameGeometry.x = -900;
+    assert.deepEqual({...moved.frameGeometry}, {x: -950, y: 120, width: 700, height: 350});
+    moved.frameGeometry = {...moved.frameGeometry, x: -900};
     custom.context.dockKbd(moved);
-    assert.equal(moved.frameGeometry.x, -900, 'custom geometry must not be repeatedly enforced');
+    assert.equal(moved.frameGeometry.x, -950, 'locked custom position must survive late placement');
     const saved = {position_mode: 'custom', dock_bottom_margin: 40,
         geometry: {x: -900, y: 120, w: 700, h: 350}};
-    const completed = run(saved, [], [moved]);
-    assert.equal(moved.frameGeometry.x, -900, 'finishing a move must leave the current frame alone');
-    completed.context.workspace.windowRemoved.emit(moved);
+    // Reloading a KWin script disconnects its old signal handlers.
+    const settled = window({resourceClass: 'handheld-kbd',
+        frameGeometry: {x: -900, y: 120, width: 700, height: 350}});
+    const completed = run(saved, [], [settled]);
+    assert.equal(settled.frameGeometry.x, -900, 'finishing a move must leave the current frame alone');
+    completed.context.workspace.windowRemoved.emit(settled);
     const reopened = window({resourceClass: 'handheld-kbd'});
     completed.add(reopened);
-    assert.deepEqual(reopened.frameGeometry, {x: -900, y: 120, width: 700, height: 350},
+    assert.deepEqual({...reopened.frameGeometry}, {x: -900, y: 120, width: 700, height: 350},
         'a new Wayland surface must restore the saved frame, ignoring the dock margin');
+
+    // KWin 6 Wayland keeps reporting the old frame until GTK commits a configure.
+    // GTK may reject the desired dock height, and scaling gives fractional sizes.
+    const delayed = waylandWindow({x: 0, y: 171, width: 1280, height: 459}, 327.2);
+    const delayedDock = run({dock_bottom_margin: 40});
+    delayedDock.context.workspace.clientArea = () => ({x: 0, y: 0, width: 1280, height: 670});
+    delayedDock.add(delayed);
+    assert.equal(delayed.requests.length, 1, 'never overwrite an asynchronous resize with its stale readback');
+    assert.equal(delayed.pending.height, 281);
+    delayed.commit();
+    assert.equal(delayed.frameGeometry.height, 327.2);
+    assert(Math.abs(delayed.frameGeometry.y - 302.8) < 0.001);
+    assert.equal(delayed.pending, null, 'anchor the accepted height without starting another resize');
+    delayed.commit({x: 0, y: 171, width: 1280, height: 327.2});
+    assert(Math.abs(670 - delayed.frameGeometry.y - delayed.frameGeometry.height - 40) < 0.001,
+        'late map positioning must not leave a docked keyboard centered');
+    delayed.commit({x: 0, y: 171, width: 1280, height: 359.2});
+    assert(Math.abs(670 - delayed.frameGeometry.y - delayed.frameGeometry.height - 40) < 0.001,
+        'late GTK minimum-size changes must retain the configured bottom margin');
+    assert.equal(delayed.pending, null);
+    for (const initialY of [349, 302.8]) {
+        const unchanged = waylandWindow({x: 0, y: initialY, width: 1280, height: 327.2}, 327.2);
+        let changes = 0;
+        unchanged.frameGeometryChanged.connect(() => changes++);
+        delayedDock.add(unchanged);
+        assert(Math.abs(unchanged.pending.y - 302.8) < 0.001,
+            'a rejected resize must already carry the correct anchor for the actual height');
+        unchanged.commit();
+        assert(Math.abs(670 - unchanged.frameGeometry.y - unchanged.frameGeometry.height - 40) < 0.001,
+            'a client returning the unchanged minimum size may emit no geometry signal');
+        assert.equal(unchanged.pending, null);
+        if (initialY === 302.8) assert.equal(changes, 0, 'the unchanged commit emits no geometry signal');
+    }
+    const fractional = {x: -1263.2, y: 316.4, w: 1280, h: 357.6};
+    const delayedCustom = run({position_mode: 'custom', geometry: fractional, dock_bottom_margin: 80});
+    const customSurface = waylandWindow({x: 0, y: 171, width: 800, height: 400});
+    delayedCustom.add(customSurface);
+    assert.equal(customSurface.requests.length, 1);
+    assert.equal(customSurface.pending.height, 357.6);
+    customSurface.commit();
+    customSurface.commit({x: 0, y: 171, width: 1280, height: 357.6});
+    assert.deepEqual(customSurface.frameGeometry,
+        {x: fractional.x, y: fractional.y, width: fractional.w, height: fractional.h},
+        'custom coordinates and size must survive scaling, delayed resize, and late map positioning');
 
     const diagnosticKbd = window({resourceClass: 'handheld-kbd'});
     const diagnosticSteam = window({resourceClass: 'steam', caption: 'SP Keyboard'});

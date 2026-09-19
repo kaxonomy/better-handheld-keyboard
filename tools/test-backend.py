@@ -2,6 +2,7 @@
 """Hardware-free checks: python3 tools/test-backend.py."""
 import contextlib
 import ast
+import ctypes
 import io
 import json
 import os
@@ -103,6 +104,18 @@ class BackendTests(unittest.TestCase):
              patch.object(backend, "_command", return_value='s ""'):
             self.assertFalse(backend.diagnostics()["ready"])
 
+    def test_diagnostics_reports_live_desktop_key_translation(self):
+        info = self.detect(hhd_api=True)
+        runtime = {"ready": True, "desktop_keys": {str(0x010000aa): "Launch8"}}
+        with patch.object(backend, "detect_backend", return_value=info), \
+             patch.object(backend, "read_runtime_status", return_value=runtime), \
+             patch.object(backend, "ally_devices", return_value=[]), \
+             patch.object(backend, "_command", return_value='s "ally-m1"'), \
+             patch.object(sys, "argv", ["backend", "--status"]), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            backend.main()
+        self.assertIn("M1 desktop key: Launch8", output.getvalue())
+
     def test_press_debounce_and_filter(self):
         press = backend.M1Press()
         self.assertFalse(press.feed(backend.EV_KEY, 188, 1, 1))  # M2 untouched
@@ -148,6 +161,75 @@ class HotkeyTests(unittest.TestCase):
             self.assertEqual(len(toggles), 1 if ready and codes == ["KEY_F17"] else 2)
 
 
+class KeymapTests(unittest.TestCase):
+    def keymap(self, values, levels=None, display=True):
+        def entries(code):
+            self.assertEqual(code, 195)  # evdev KEY_F17 + the XKB offset
+            return bool(values), [SimpleNamespace(level=level) for level in (levels or [0] * len(values))], values
+        gdk = SimpleNamespace(KEY_F17=0xffce, KEY_Launch8=0x1008ff48,
+                              Display=SimpleNamespace(get_default=lambda: object() if display else None),
+                              Keymap=SimpleNamespace(get_for_display=lambda display:
+                                  SimpleNamespace(get_entries_for_keycode=entries)),
+                              keyval_name=lambda value: hex(value))
+        with patch.dict(sys.modules, {"gi": SimpleNamespace(require_version=lambda *args: None),
+                                      "gi.repository": SimpleNamespace(Gdk=gdk)}):
+            return backend.m1_shortcut_keys()
+
+    def test_live_keymap_selects_only_the_unmodified_m1_symbol(self):
+        self.assertEqual(self.keymap([0xffce]), {0x01000040: "F17"})
+        self.assertEqual(self.keymap([0x1008ff48]), {0x010000aa: "Launch8"})
+        self.assertEqual(self.keymap([0x1008ff48, 0xffce], [0, 1]), {0x010000aa: "Launch8"})
+        self.assertEqual(self.keymap([0xffce, 0x1008ff48]), {0x01000040: "F17", 0x010000aa: "Launch8"})
+        for values, display in (([], True), ([0x1008ff49], True), ([0xffce], False)):
+            with self.assertRaisesRegex(RuntimeError, "M1 desktop keymap"):
+                self.keymap(values, display=display)
+
+    def test_real_xkb_stock_and_normalized_function_key_maps(self):
+        try:
+            lib = ctypes.CDLL("libxkbcommon.so.0")
+        except OSError:
+            self.skipTest("libxkbcommon unavailable")
+        if not Path("/usr/share/X11/xkb/symbols/inet").exists():
+            self.skipTest("system XKB rules unavailable")
+        pointer = ctypes.c_void_p
+        signatures = {
+            "xkb_context_new": (pointer, [ctypes.c_int]),
+            "xkb_keymap_new_from_string": (pointer, [pointer, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]),
+            "xkb_keymap_key_get_syms_by_level": (ctypes.c_int, [pointer, ctypes.c_uint, ctypes.c_uint,
+                ctypes.c_uint, ctypes.POINTER(ctypes.POINTER(ctypes.c_uint))]),
+            "xkb_keymap_unref": (None, [pointer]),
+            "xkb_context_unref": (None, [pointer]),
+        }
+        for name, (result, arguments) in signatures.items():
+            getattr(lib, name).restype = result
+            getattr(lib, name).argtypes = arguments
+        context = lib.xkb_context_new(0)
+        self.assertTrue(context)
+        try:
+            # Compile the installed inet(evdev) data, then a normal F17 override.
+            # The stock alias is deliberately not mocked: this caught the bug.
+            for override, expected in (("", {0x010000aa: "Launch8"}),
+                                       ('key <FK17> { [ F17 ] };', {0x01000040: "F17"})):
+                source = '''xkb_keymap {
+                    xkb_keycodes { include "evdev+aliases(qwerty)" };
+                    xkb_types { include "complete" };
+                    xkb_compatibility { include "complete" };
+                    xkb_symbols { include "pc+us+inet(evdev)" %s };
+                };''' % override
+                keymap = lib.xkb_keymap_new_from_string(context, source.encode(), 1, 0)
+                self.assertTrue(keymap)
+                try:
+                    symbols = ctypes.POINTER(ctypes.c_uint)()
+                    count = lib.xkb_keymap_key_get_syms_by_level(keymap, backend.KEY_F17 + 8, 0, 0,
+                                                               ctypes.byref(symbols))
+                    self.assertGreater(count, 0)
+                    self.assertEqual(self.keymap(list(symbols[:count])), expected)
+                finally:
+                    lib.xkb_keymap_unref(keymap)
+        finally:
+            lib.xkb_context_unref(context)
+
+
 class ShortcutConflictTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -159,6 +241,8 @@ class ShortcutConflictTests(unittest.TestCase):
         Path(self.command).touch()
         self.component = "net.local.handheld-kbd-toggle.desktop"
         self.f17 = 0x01000040
+        self.m1_keys = {self.f17: "F17"}
+        self.mapping = patch.object(backend, "m1_shortcut_keys", side_effect=lambda: self.m1_keys).start()
         self.info = ["_launch", "Keyboard", self.component, "Keyboard", "default", "Default", [], []]
         self.infos, self.calls = [self.info], []
         self.keys = [([self.f17, 0, 0, 0],)]
@@ -169,7 +253,9 @@ class ShortcutConflictTests(unittest.TestCase):
                              ("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel"))
             self.calls.append((method, params))
             if method == "globalShortcutsByKey":
-                self.assertEqual(params, ("((ai)(i))", (([self.f17, 0, 0, 0],), (0,))))
+                code = params[1][0][0][0]
+                self.assertIn(code, self.m1_keys)
+                self.assertEqual(params, ("((ai)(i))", (([code, 0, 0, 0],), (0,))))
                 value = (self.infos,)
             elif method == "shortcutKeys":
                 value = (self.keys,)
@@ -212,6 +298,23 @@ class ShortcutConflictTests(unittest.TestCase):
         self.assertEqual(backend.resolve_m1_shortcut_conflicts(), [self.component])
         self.assertEqual(self.keys, [])
         self.assertEqual(self.calls[2][1][1][0][0], self.component + "|custom")
+
+    def test_launch8_mapping_leaves_unrelated_function_key_and_m2_shortcuts(self):
+        launch8 = 0x010000aa
+        self.m1_keys = {launch8: "Launch8"}
+        retained = [([self.f17, 0, 0, 0],),             # unrelated literal F17
+                    ([launch8 + 1, 0, 0, 0],),        # M2 maps to Launch9
+                    ([launch8 | 0x02000000, 0, 0, 0],),
+                    ([launch8, 65, 0, 0],)]
+        self.keys = [([launch8, 0, 0, 0],)] + retained
+        self.assertEqual(backend.resolve_m1_shortcut_conflicts(), [self.component])
+        self.assertEqual(self.keys, retained)
+
+    def test_missing_keymap_cannot_guess_or_change_a_shortcut(self):
+        self.mapping.side_effect = RuntimeError("M1 desktop keymap unavailable")
+        with self.assertRaisesRegex(RuntimeError, "keymap unavailable"):
+            backend.resolve_m1_shortcut_conflicts()
+        self.assertEqual(self.calls, [])
 
     def test_modern_glib_desktop_app_info_namespace(self):
         unix = SimpleNamespace(DesktopAppInfo=self.gio.DesktopAppInfo)
@@ -285,6 +388,7 @@ class DeviceTests(unittest.TestCase):
 
     def trigger(self):
         candidate_fn = backend.ally_devices
+        self.keymap = patch.object(backend, "m1_shortcut_keys", return_value={0x01000040: "F17"}).start()
         self.shortcut_cleanup = patch.object(backend, "resolve_m1_shortcut_conflicts", return_value=[]).start()
         patch.object(backend, "ally_devices", side_effect=lambda dmi: candidate_fn(dmi, self.sysfs, self.devroot)).start()
         self.calls, self.opened, self.removed, self.watches = [], [], [], []
@@ -348,7 +452,8 @@ class DeviceTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             trigger.rescan()
             trigger.rescan()
-        self.shortcut_cleanup.assert_called_once_with()
+        self.shortcut_cleanup.assert_called_once_with({0x01000040: "F17"})
+        self.assertEqual(backend.read_runtime_status()["desktop_keys"], {str(0x01000040): "F17"})
         with contextlib.redirect_stderr(io.StringIO()):
             trigger.disconnect()
             trigger.rescan()
@@ -360,10 +465,41 @@ class DeviceTests(unittest.TestCase):
         self.shortcut_cleanup.side_effect = RuntimeError("service unavailable")
         with contextlib.redirect_stderr(io.StringIO()) as log:
             trigger.rescan()
-        self.assertIn("could not check/remove duplicate Plasma F17", log.getvalue())
+            trigger.rescan()
+        self.assertIn("could not check/remove duplicate Plasma M1", log.getvalue())
         self.assertIn("service unavailable", log.getvalue())
+        self.assertEqual(log.getvalue().count("could not check/remove"), 1)
         self.assertIsNotNone(trigger.device)
         self.assertTrue(backend.read_runtime_status()["ready"])
+        self.assertEqual(backend.read_runtime_status()["shortcut_error"], "service unavailable")
+        self.assertFalse(trigger.shortcut_checked)
+        self.shortcut_cleanup.side_effect = None
+        trigger.rescan()
+        self.assertTrue(trigger.shortcut_checked)
+        self.assertEqual(self.shortcut_cleanup.call_count, 3)
+        self.assertEqual(self.keymap.call_count, 1)
+        trigger.rescan()
+        self.assertEqual(self.shortcut_cleanup.call_count, 3, "stop retrying after successful migration")
+        self.assertEqual(backend.read_runtime_status()["shortcut_error"], "")
+
+    def test_keymap_not_ready_at_login_retries_without_reopening_device(self):
+        trigger = self.trigger()
+        self.device("event5")
+        mapping = {0x010000aa: "Launch8"}
+        self.keymap.side_effect = [RuntimeError("keymap unavailable"), RuntimeError("keymap unavailable"), mapping]
+        with contextlib.redirect_stderr(io.StringIO()) as log:
+            trigger.rescan()
+            trigger.rescan()
+            self.shortcut_cleanup.assert_not_called()
+            trigger.rescan()
+            trigger.rescan()
+        self.assertEqual(log.getvalue().count("could not check/remove"), 1)
+        self.assertIn("M1 desktop key: Launch8", log.getvalue())
+        self.shortcut_cleanup.assert_called_once_with(mapping)
+        self.assertEqual(self.keymap.call_count, 3)
+        self.assertEqual(len(self.opened), 1)
+        self.assertEqual(trigger.shortcut_keys, mapping)
+        self.assertTrue(trigger.shortcut_checked)
 
     def test_events_toggle_only_m1_and_never_write(self):
         self.device("event5")

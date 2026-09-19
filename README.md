@@ -145,9 +145,11 @@ The M1 visibility path is:
 1. The ASUS listener filters F17 press/release/repeat events using their kernel
    timestamps. A busy GTK loop cannot turn queued contact bounce into two presses.
    An optional F17 hotkey ignores that same device while the direct listener owns it.
-   Once that listener opens successfully, a duplicate Plasma F17 shortcut running
-   `handheld-kbd-toggle` is removed through KGlobalAccel. This prevents the direct
-   press and the launched command toggling twice. The desktop entry, other key
+   Once that listener opens successfully, its live desktop keymap is checked:
+   Linux `KEY_F17` normally becomes **Launch (8)** in Plasma, not F17. A duplicate
+   shortcut for that mapped key running `handheld-kbd-toggle` is removed through
+   KGlobalAccel. This prevents the direct press and the launched command toggling
+   twice. The desktop entry, other key
    combinations and M2 remain unchanged; the migration is logged. It uses KDE's
    [shortcut API](https://github.com/KDE/kglobalaccel/blob/v6.22.0/src/org.kde.KGlobalAccel.xml).
 2. The accepted press reaches the shared toggle handler directly. If a native
@@ -173,8 +175,10 @@ Free movement uses touch/mouse gestures and KWin's logical `frameGeometry` throu
 the keyboard's session DBus service. Docking is suspended while moving; Done or
 hiding the keyboard saves the geometry reported by KWin before unmapping it. The
 drag handle overlays the keys so removing it cannot shift the layout. The helper
-restores that rectangle on later shows and restarts. Position rules no longer
-force a competing rectangle.
+restores that rectangle on later shows and restarts, retaining fractional logical
+coordinates on scaled displays. Docking anchors to the actual frame as Wayland
+resize replies arrive, so GTK's minimum height cannot change the bottom margin.
+Position rules no longer force a competing rectangle.
 The helper uses the [KWin 6 scripting API](https://develop.kde.org/docs/plasma/kwin/api/).
 
 To leave a gap above the usable bottom edge:

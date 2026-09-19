@@ -158,8 +158,40 @@ def ally_devices(dmi, sysfs="/sys/class/input", devroot="/dev/input"):
     return devices
 
 
-def resolve_m1_shortcut_conflicts():
-    """Retire only duplicate plain-F17 launch shortcuts for our toggle command."""
+def m1_shortcut_keys():
+    """Translate physical M1 through the compositor's current keyboard map."""
+    import gi
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk
+    display = Gdk.Display.get_default()
+    if display is None:
+        raise RuntimeError("M1 desktop keymap unavailable: no GDK display")
+    keymap = Gdk.Keymap.get_for_display(display)
+    if keymap is None:
+        raise RuntimeError("M1 desktop keymap unavailable")
+    found, entries, values = keymap.get_entries_for_keycode(KEY_F17 + 8)
+    # Linux F17 commonly becomes XF86Launch8 in inet(evdev). KDE shortcuts use
+    # the translated Qt key, not evdev 187. Inspect only unmodified levels.
+    known = {Gdk.KEY_F17: (0x01000040, "F17"), Gdk.KEY_Launch8: (0x010000aa, "Launch8")}
+    keys = {}
+    unknown = []
+    for entry, value in zip(entries or [], values or []):
+        if entry.level != 0:
+            continue
+        if value in known:
+            code, name = known[value]
+            keys[code] = name
+        else:
+            unknown.append(Gdk.keyval_name(value) or hex(value))
+    if not found or not keys or unknown:
+        raise RuntimeError("M1 desktop keymap unsupported: " + (", ".join(unknown) or "no unmodified F17/Launch8 mapping"))
+    return keys
+
+
+def resolve_m1_shortcut_conflicts(shortcut_keys=None):
+    """Retire only duplicate unmodified M1 shortcuts for our toggle command."""
+    if shortcut_keys is None:
+        shortcut_keys = m1_shortcut_keys()
     from gi.repository import Gio, GLib
     try:
         from gi.repository import GioUnix
@@ -171,10 +203,11 @@ def resolve_m1_shortcut_conflicts():
                              method, GLib.Variant(signature, values), None,
                              Gio.DBusCallFlags.NO_AUTO_START, 2000, None).unpack()
 
-    # Qt::Key_F17, not Linux's evdev code. Use the v2 API so other multi-step
-    # shortcuts survive; the deprecated integer API loses their later strokes.
-    f17 = 0x01000040
-    shortcuts = call("globalShortcutsByKey", "((ai)(i))", (([f17, 0, 0, 0],), (0,)))[0]
+    # Use the v2 API so other multi-step shortcuts survive; the deprecated
+    # integer API loses their later strokes.
+    shortcuts = []
+    for code in shortcut_keys:
+        shortcuts.extend(call("globalShortcutsByKey", "((ai)(i))", (([code, 0, 0, 0],), (0,)))[0])
     expected = os.path.realpath(os.path.expanduser("~/.local/bin/handheld-kbd-toggle"))
     changed = []
     for info in shortcuts:
@@ -197,7 +230,7 @@ def resolve_m1_shortcut_conflicts():
                      action, friendly, title]
         keys = call("shortcutKeys", "(as)", (action_id,))[0]
         retained = [key for key in keys if not (1 <= len(key[0]) <= 4
-                    and key[0][0] == f17 and not any(key[0][1:]))]
+                    and key[0][0] in shortcut_keys and not any(key[0][1:]))]
         if len(retained) == len(keys):
             continue
         # This is KGlobalAccel's supported foreign-action edit: NoAutoloading,
@@ -205,7 +238,7 @@ def resolve_m1_shortcut_conflicts():
         call("setForeignShortcutKeys", "(asa(ai))", (action_id, retained))
         actual = call("shortcutKeys", "(as)", (action_id,))[0]
         if {tuple(key[0]) for key in actual} != {tuple(key[0]) for key in retained}:
-            raise RuntimeError("Plasma F17 shortcut change did not take effect for " + component)
+            raise RuntimeError("Plasma M1 shortcut change did not take effect for " + component)
         changed.append(component)
     return changed
 
@@ -253,6 +286,9 @@ class AllyM1Trigger:
         self.press = M1Press()
         self.dropped = False
         self.error = ""
+        self.shortcut_keys = {}
+        self.shortcut_checked = False
+        self.shortcut_error = ""
         self._status()
         self.rescan()
         self.timer = glib.timeout_add_seconds(2, self.rescan)
@@ -264,7 +300,8 @@ class AllyM1Trigger:
     def _status(self):
         status = {"pid": os.getpid(), "backend": "hhd", "trigger": "ally-m1",
                   "ready": self.device is not None, "device": self.device.path if self.device else "",
-                  "event": "KEY_F17 (187)", "error": self.error}
+                  "event": "KEY_F17 (187)", "error": self.error,
+                  "desktop_keys": self.shortcut_keys, "shortcut_error": self.shortcut_error}
         try:
             path = runtime_path()
             fd, name = tempfile.mkstemp(prefix=".handheld-kbd-backend-", dir=path.parent)
@@ -285,6 +322,29 @@ class AllyM1Trigger:
         self.identity = None
         self.press = M1Press()
         self.dropped = False
+        self.shortcut_keys = {}
+        self.shortcut_checked = False
+        self.shortcut_error = ""
+        self._status()
+
+    def _check_shortcuts(self):
+        if self.shortcut_checked:
+            return
+        try:
+            if not self.shortcut_keys:
+                self.shortcut_keys = m1_shortcut_keys()
+                self._log("M1 desktop key: " + ", ".join(self.shortcut_keys.values()))
+            for component in resolve_m1_shortcut_conflicts(self.shortcut_keys):
+                self._log("Removed duplicate Plasma M1 toggle shortcut from " + component
+                          + "; direct M1 handles it, other shortcuts unchanged")
+            self.shortcut_checked = True
+            self.shortcut_error = ""
+            self._log("M1 shortcut conflict check complete", debug=True)
+        except Exception as ex:
+            error = str(ex)
+            if error != self.shortcut_error:
+                self._log(f"could not check/remove duplicate Plasma M1 toggle shortcuts ({error}); retrying")
+            self.shortcut_error = error
         self._status()
 
     def rescan(self):
@@ -293,6 +353,7 @@ class AllyM1Trigger:
             try:
                 stat = os.stat(self.device.path)
                 if any(item["path"] == self.device.path for item in candidates) and self.identity == (stat.st_ino, stat.st_rdev):
+                    self._check_shortcuts()
                     return True
             except OSError:
                 pass
@@ -316,12 +377,7 @@ class AllyM1Trigger:
                 # notifications from the same press can change visibility.
                 self.watch = self.glib.io_add_watch(device.fd, self.glib.PRIORITY_HIGH,
                     self.glib.IO_IN | self.glib.IO_HUP | self.glib.IO_ERR, self.on_input)
-                try:
-                    for component in resolve_m1_shortcut_conflicts():
-                        self._log("Removed duplicate Plasma F17 toggle shortcut from " + component
-                                  + "; direct M1 handles it, other shortcuts unchanged")
-                except Exception as ex:
-                    self._log(f"could not check/remove duplicate Plasma F17 toggle shortcuts ({ex})")
+                self._check_shortcuts()
                 self.error = ""
                 self._status()
                 self._log(f"M1 listening on {device.path} ({device.name}), KEY_F17; HHD M2 unchanged")
@@ -416,7 +472,8 @@ def diagnostics():
     info.update({"ready": bool(runtime.get("ready")) and info["trigger"] == "ally-m1",
                  "m1_devices": candidates, "selected_m1_device": selected,
                  "selected_m1_name": next((item["name"] for item in candidates if item["path"] == selected), ""),
-                 "selected_m1_event": "KEY_F17 (187)" if info["ally_m1"] else "", "error": runtime.get("error", "")})
+                 "selected_m1_event": "KEY_F17 (187)" if info["ally_m1"] else "", "error": runtime.get("error", ""),
+                 "desktop_keys": runtime.get("desktop_keys", {}), "shortcut_error": runtime.get("shortcut_error", "")})
     # A TTY or SSH caller may not share the graphical process's runtime directory.
     # Prefer the running service over that caller's cached status file.
     live = _command(["busctl", "--user", "call", "org.handheld.Keyboard", "/org/handheld/Keyboard",
@@ -456,9 +513,12 @@ def main():
         if info["selected_m1_name"]:
             print(f"M1 device name: {info['selected_m1_name']}")
         print(f"M1 event: {info['selected_m1_event'] or 'none'}")
+        print(f"M1 desktop key: {', '.join(info['desktop_keys'].values()) or 'unknown'}")
         print(f"M1 listener: {'ready' if info['ready'] else 'inactive'}")
         if info["error"]:
             print(f"M1 detail: {info['error']}")
+        if info["shortcut_error"]:
+            print(f"M1 shortcut detail: {info['shortcut_error']}")
 
 
 if __name__ == "__main__":

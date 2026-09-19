@@ -89,7 +89,7 @@ try:
 except (TypeError, ValueError):
     margin = 0
 print(place, max(0.15, min(frac, 0.95)),
-      int(g.get("x", 0)), int(g.get("y", 0)), int(g.get("w", 0)), int(g.get("h", 0)),
+      float(g.get("x", 0)), float(g.get("y", 0)), float(g.get("w", 0)), float(g.get("h", 0)),
       margin, 1 if d.get("kwin_fullscreen_lift", True) else 0,
       1 if d.get("debug", False) else 0)' 2>/dev/null)
 set -- $DOCK_CFG
@@ -114,7 +114,7 @@ case "$MIRROR" in 0|1) : ;; *) MIRROR=1 ;; esac
 case "$PLACE" in dock|custom|none) : ;; *) PLACE=dock ;; esac
 case "$FRAC" in ''|*[!0-9.]*) FRAC=0.42 ;; esac
 for v in CX CY CW CH; do
-    eval "val=\$$v"; case "$val" in ''|*[!0-9-]*) eval "$v=0" ;; esac
+    eval "val=\$$v"; case "$val" in ''|*[!0-9.-]*) eval "$v=0" ;; esac
 done
 
 case "$HIDE_STEAM" in 1) CLOSE_STEAM=1 ;; *) CLOSE_STEAM=0 ;; esac
@@ -173,7 +173,7 @@ function isSteamOsk(w){
 }
 function windowMetadata(w){
     var result = {};
-    ["resourceClass", "resourceName", "desktopFileName", "windowRole", "internalId", "pid", "layer", "keepAbove"].forEach(function(key){
+    ["resourceClass", "resourceName", "desktopFileName", "windowRole", "internalId", "pid", "layer", "keepAbove", "opacity"].forEach(function(key){
         result[key] = textProp(w, key);
     });
     // Ordinary Steam titles can include chat or browser text. Only identified OSK
@@ -187,6 +187,9 @@ function windowMetadata(w){
         var area = workspace.clientArea(KWin.MaximizeArea, w);
         result.usableArea = {x: area.x, y: area.y, w: area.width, h: area.height};
         result.bottomMargin = area.y + area.height - g.y - g.height;
+        result.placement = PLACE;
+        result.configuredBottomMargin = BOTTOM_MARGIN;
+        if (w.minSize) result.minimumSize = {w: w.minSize.width, h: w.minSize.height};
     }
     return result;
 }
@@ -237,38 +240,53 @@ function applyStack(){
 // clientArea(MaximizeArea) is in logical pixels and already excludes panels, so this is
 // right at any resolution, any scale factor, and with a panel of any size on any edge.
 var placing = false;   // re-entry guard: we resize the window inside its own signal
-var placedCustom = {};  // a custom spot is applied once per window, never re-asserted
+var placedCustom = {}; // request the saved size once per surface
+var dockAreas = {};    // request a dock size only when its usable area changes
+function anchorKbd(w, area){
+    var g = w.frameGeometry;
+    var x = PLACE === "custom" ? CUSTOM.x : area.x;
+    var y = PLACE === "custom" ? CUSTOM.y : Math.max(area.y, area.y + area.height - g.height - BOTTOM_MARGIN);
+    if (Math.abs(g.x - x) < 0.01 && Math.abs(g.y - y) < 0.01) return;
+    // Keep the actual client size. Re-requesting a rejected height on every frame
+    // fights GTK's minimum size and prevents Wayland configure events settling.
+    w.frameGeometry = {x: x, y: y, width: g.width, height: g.height};
+}
 function dockKbd(w){
     if (PLACE === "none" || !isKbd(w) || placing) return;
     placing = true;
-    if (PLACE === "custom") {
-        if (placedCustom["" + w.internalId]) { placing = false; return; }
-        placedCustom["" + w.internalId] = true;
-        try {
-            var cg = w.frameGeometry;
-            cg.x = CUSTOM.x; cg.y = CUSTOM.y;
-            cg.width = CUSTOM.width; cg.height = CUSTOM.height;
-            w.frameGeometry = cg;
-        } catch(e){}
-        placing = false;
-        return;
-    }
     try {
+        var id = "" + w.internalId;
         var area = workspace.clientArea(KWin.MaximizeArea, w);
-        var h = Math.max(120, Math.round(area.height * FRAC));
-        var geo = w.frameGeometry;
-        geo.x = area.x; geo.width = area.width;
-        geo.height = h; geo.y = Math.max(area.y, area.y + area.height - h - BOTTOM_MARGIN);
-        w.frameGeometry = geo;
-        // The client has a minimum size, so it may come back taller than we asked. Re-anchor
-        // to whatever it actually became, or the extra height hangs off the bottom edge.
-        var got = w.frameGeometry;
-        if (got.height !== h || got.width !== area.width) {
-            got.x = area.x;
-            got.y = Math.max(area.y, area.y + area.height - got.height - BOTTOM_MARGIN);
-            w.frameGeometry = got;
+        var request = null;
+        if (PLACE === "custom") {
+            if (!placedCustom[id]) {
+                placedCustom[id] = true;
+                request = CUSTOM;
+            }
+        } else {
+            var key = [area.x, area.y, area.width, area.height].join(",");
+            if (dockAreas[id] !== key) {
+                dockAreas[id] = key;
+                var h = Math.max(120, Math.round(area.height * FRAC));
+                // Anchor the current height first. If GTK rejects the resize and
+                // commits an unchanged frame, KWin emits no geometry signal.
+                request = {x: area.x, y: Math.max(area.y, area.y + area.height - w.frameGeometry.height - BOTTOM_MARGIN),
+                           width: area.width, height: h};
+            }
         }
-    } catch(e){}
+        if (!request) {
+            anchorKbd(w, area);
+            placing = false;
+            return;
+        }
+        // The size request is recorded above, so its synchronous geometry signal
+        // can safely re-enter and anchor the accepted frame without another resize.
+        placing = false;
+        w.frameGeometry = request;
+        // KWin queues Wayland resizes. Until the client commits, frameGeometry is
+        // still the OLD frame: writing it back here cancels the requested resize.
+        // Both synchronous and asynchronous changes anchor in frameGeometryChanged.
+    } catch(e){ failed("placement", e); }
     placing = false;
 }
 
@@ -281,9 +299,9 @@ function watch(w){
     // Keep it pinned: GTK can settle on a different height slightly after we place it
     // (the suggestion row, a font metric), which would otherwise leave the keyboard
     // floating short of the bottom edge until something else moved it.
-    // Only the dock re-asserts itself. A custom spot is placed once and then left alone,
-    // so the keyboard behaves like a normal window you happened to put there.
-    if (PLACE === "dock" && isKbd(w)) {
+    // Only position is corrected after the requested resize. Free movement reloads
+    // PLACE=none, so no saved position can fight the drag/resize bridge.
+    if (PLACE !== "none" && isKbd(w)) {
         try { w.frameGeometryChanged.connect(function(){ dockKbd(w); }); } catch(e){}
     }
 }
@@ -408,8 +426,7 @@ if (ACTION === "diagnostics") {
 
 workspace.windowList().forEach(function(w){
     setOp(w); watch(w);
-    // Existing windows: in custom placement, mark as already placed so a script reload
-    // leaves them untouched. Docking still re-asserts, because that is ours to compute.
+    // Existing custom windows already have their saved size; don't request it again.
     if (PLACE === "custom") placedCustom[""+w.internalId] = true;
     dockKbd(w);
     // A Steam OSK left over from before this script loaded is still holding the
@@ -425,6 +442,8 @@ workspace.windowAdded.connect(onAdded);
 workspace.windowRemoved.connect(function(w){
     applyStack();
     delete seenSteam[textProp(w, "internalId")];
+    delete placedCustom[textProp(w, "internalId")];
+    delete dockAreas[textProp(w, "internalId")];
     // Only mirror the close when we are not the ones closing it — otherwise our own
     // closeWindow() would hide the keyboard we just summoned.
     if (MIRROR && !CLOSE_STEAM && isSteamOsk(w)) {
