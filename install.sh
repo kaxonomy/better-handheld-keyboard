@@ -11,11 +11,19 @@ SHARE="$HOME/.local/share/handheld-kbd"
 KWIN="$HOME/.local/share/kwin/scripts/handheld-kbd-opacity"
 AUTO="$HOME/.config/autostart"
 RULE_UUID="a8a95de3-82aa-4998-87c0-125fb8525143"
+STEAM_RULE_UUID="6c4263a8-3263-4d41-85f7-75c704113edb"
+STEAM_RULES=( "$STEAM_RULE_UUID" 6c4263a8-3263-4d41-85f7-75c704113edc 6c4263a8-3263-4d41-85f7-75c704113edd )
 
 say() { printf '\033[1;36m::\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
 
 say "Installing Better Handheld Keyboard…"
+
+# A distro may ship either controller daemon. Inspect the running services, not its name
+# or the presence of InputPlumber's default profile/CLI.
+INPUT_BACKEND=$(python3 "$HERE/bin/handheld_kbd_backend.py" --field backend) || INPUT_BACKEND=generic
+INPUT_TRIGGER=$(python3 "$HERE/bin/handheld_kbd_backend.py" --field trigger) || INPUT_TRIGGER=mirror
+say "Input backend: $INPUT_BACKEND; trigger: $INPUT_TRIGGER"
 
 # --- migrate from a previous 'claude-osk' install, if present ---
 if [ -e "$HOME/.local/bin/claude-kbd.py" ] || [ -d "$HOME/.config/claude-osk" ]; then
@@ -46,7 +54,7 @@ mkdir -p "$BIN" "$CFG/layouts" "$CFG/locales" "$KWIN/contents/code" "$AUTO"
 # already there from last time, so the prompt should never appear at all.
 RULE=/etc/udev/rules.d/60-handheld-kbd.rules
 ensure_privilege() {
-  if [ -f "$RULE" ] && { id -nG | tr ' ' '\n' | grep -qx input || [ -w /dev/uinput ]; }; then
+  if [ -f "$RULE" ] && { id -nG | tr ' ' '\n' | grep -qx input || { [ "$INPUT_TRIGGER" != ally-m1 ] && [ -w /dev/uinput ]; }; }; then
     PRIV_OK=1
     say "Keyboard-injection permission already in place — no password needed."
     return
@@ -94,6 +102,7 @@ install -m755 "$HERE/bin/handheld-kbd-resume-watch.py" "$BIN/"
 # imported by handheld-kbd.py (prediction + swipe engines), not run directly
 install -m644 "$HERE/bin/handheld_kbd_predict.py" "$BIN/"
 install -m644 "$HERE/bin/handheld_kbd_swipe.py"   "$BIN/"
+install -m644 "$HERE/bin/handheld_kbd_backend.py" "$BIN/"
 
 # --- config (never clobber the user's edits) ---
 FRESH=0
@@ -220,6 +229,7 @@ done
 SEAMLESS_DMI='83N0 83N1'        # Lenovo Legion Go 2 — has a real keyboard button
 
 seamless_supported() {
+  [ "$INPUT_BACKEND" = inputplumber ] || return 1
   [ -f /usr/share/inputplumber/profiles/default.yaml ] || return 1
   command -v busctl >/dev/null 2>&1 || return 1
   local product
@@ -228,7 +238,9 @@ seamless_supported() {
   return 1
 }
 
-if [ "$FRESH" = 1 ]; then
+if [ "$INPUT_TRIGGER" = ally-m1 ]; then
+  say "HHD Ally M1 support enabled — InputPlumber is not required. M2 keeps its HHD action."
+elif [ "$FRESH" = 1 ]; then
   if seamless_supported; then
     say "Seamless mode — your keyboard button will summon this keyboard directly."
     python3 - "$CFG/config.json" <<'PY'
@@ -239,35 +251,7 @@ PY
   else
     say "Mirror mode — this keyboard replaces the system on-screen keyboard."
   fi
-elif ! seamless_supported && python3 -c 'import json,os,sys
-p=os.path.expanduser("~/.config/handheld-kbd/config.json")
-try: sys.exit(0 if json.load(open(p)).get("mirror", True) is False else 1)
-except Exception: sys.exit(1)' 2>/dev/null; then
-  # Repair an existing install that an earlier version put into seamless mode on hardware
-  # that can't drive it. Left alone, the keyboard button does nothing at all.
-  warn "This device is in seamless mode but has no keyboard button that can trigger it."
-  python3 - "$CFG/config.json" <<'PY'
-import json,sys
-p=sys.argv[1]; d=json.load(open(p)); d['mirror']=True
-json.dump(d,open(p,'w'),indent=2)
-PY
-  say "Switched to mirror mode — press whatever opens the Steam keyboard."
-  pkill -f 'handheld-kbd-swap\.sh' 2>/dev/null || true
-  if [ -f /usr/share/inputplumber/profiles/default.yaml ] && command -v busctl >/dev/null 2>&1; then
-    for dev in $(busctl --system tree org.shadowblip.InputPlumber 2>/dev/null \
-                 | grep -oE '/org/shadowblip/InputPlumber/CompositeDevice[0-9]+'); do
-      busctl --system call org.shadowblip.InputPlumber "$dev" \
-        org.shadowblip.Input.CompositeDevice LoadProfilePath s \
-        /usr/share/inputplumber/profiles/default.yaml >/dev/null 2>&1
-    done
-    say "Restored InputPlumber's stock button mapping."
-  fi
 fi
-
-# --- work out the bottom dock for THIS panel (for the initial KWin rule) ---
-# The keyboard computes this itself at runtime from dock_height_frac; this only stops the
-# forced rule flashing the window at the wrong size on the very first show.
-PANEL_RECT="$(python3 "$HERE/bin/handheld-kbd-dock-rect" 2>/dev/null || true)"
 
 # --- KWin translucency script ---
 # Generated, never copied: a static copy used to be installed here and it diverged from
@@ -298,7 +282,7 @@ for s in "$HERE"/shortcuts/*.desktop; do
 done
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS" 2>/dev/null
 
-# --- KWin window rule (pins the keyboard: on top, no focus-steal, bottom-docked) ---
+# --- KWin window rules (no focus-steal; geometry belongs to the script) ---
 if command -v kwriteconfig6 >/dev/null 2>&1; then
   K=( kwriteconfig6 --file kwinrulesrc --group "$RULE_UUID" --key )
   "${K[@]}" Description "Better Handheld Keyboard"
@@ -308,21 +292,43 @@ if command -v kwriteconfig6 >/dev/null 2>&1; then
   "${K[@]}" noborder true;         "${K[@]}" noborderrule 2
   "${K[@]}" skiptaskbar true;      "${K[@]}" skiptaskbarrule 2
   "${K[@]}" skippager true;        "${K[@]}" skippagerrule 2
-  # The forced position/size must match the geometry above, or the rule fights the window
-  # on first show. The keyboard rewrites both live (move key, big mode), so this is just
-  # the starting point — but on a panel that isn't 1280x800 the old hardcoded values put
-  # the window partly off-screen until something moved it.
-  RULE_GEOM="${PANEL_RECT:-0,378 1280,422}"
-  RULE_POS="${RULE_GEOM%% *}"; RULE_SIZE="${RULE_GEOM##* }"
-  "${K[@]}" position "$RULE_POS";  "${K[@]}" positionrule 2
-  "${K[@]}" size "$RULE_SIZE";     "${K[@]}" sizerule 2
+  "${K[@]}" positionrule 0;       "${K[@]}" sizerule 0
+  "${K[@]}" position --delete;    "${K[@]}" size --delete
+
+  # Steam's XWayland OSK can activate before windowAdded reaches the script. Match its
+  # identity AND keyboard title before mapping, so opening it cannot dismiss Kickoff.
+  STEAM_MODE=0
+  if busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+       org.freedesktop.DBus NameHasOwner s org.handheld.Keyboard 2>/dev/null | grep -q true; then
+    STEAM_MODE=$(kreadconfig6 --file kwinrulesrc --group "$STEAM_RULE_UUID" --key opacityactiverule --default 0)
+  fi
+  [ "$STEAM_MODE" = 2 ] || STEAM_MODE=0
+  for rule in "${STEAM_RULES[@]}"; do
+    S=( kwriteconfig6 --file kwinrulesrc --group "$rule" --key )
+    "${S[@]}" Description "Better Handheld Keyboard — Steam keyboard"
+    "${S[@]}" wmclass '(?i)(^|[ /])(steam|steamwebhelper|steam_osx|com\.valvesoftware\.steam)([ ._-]|$)'
+    "${S[@]}" wmclassmatch 3;       "${S[@]}" wmclasscomplete true
+    "${S[@]}" titlematch 0;         "${S[@]}" windowrolematch 0
+    "${S[@]}" acceptfocus false;    "${S[@]}" acceptfocusrule "$STEAM_MODE"
+    "${S[@]}" opacityactive 0;     "${S[@]}" opacityinactive 0
+    # Preserve a running supervisor's state on reinstall; only it enables fresh rules.
+    "${S[@]}" opacityactiverule "$STEAM_MODE"; "${S[@]}" opacityinactiverule "$STEAM_MODE"
+  done
+  S=( kwriteconfig6 --file kwinrulesrc --group "${STEAM_RULES[0]}" --key )
+  "${S[@]}" title '(?i)^((?:Steam(?: Input)?|SP)[ :_-]+)?(?:On[- ]?screen[ _-]+|Virtual[ _-]+)?Keyboard(?:[ _-]+[-–—][ _-]+Steam)?$'
+  "${S[@]}" titlematch 3
+  S=( kwriteconfig6 --file kwinrulesrc --group "${STEAM_RULES[1]}" --key )
+  "${S[@]}" windowrole '(?i)^(steam[- _]?)?(osk|keyboard|on[- _]?screen[- _]?keyboard)$'
+  "${S[@]}" windowrolematch 3
+  S=( kwriteconfig6 --file kwinrulesrc --group "${STEAM_RULES[2]}" --key )
+  "${S[@]}" wmclass '(?i)(^|[ /])steam[-_.](osk|keyboard)([ ._-]|$)'
   cur="$(kreadconfig6 --file kwinrulesrc --group General --key rules 2>/dev/null)"
-  case ",$cur," in *",$RULE_UUID,"*) : ;; *)
-    new="${cur:+$cur,}$RULE_UUID"
-    kwriteconfig6 --file kwinrulesrc --group General --key rules "$new"
-    kwriteconfig6 --file kwinrulesrc --group General --key count \
-      "$(printf '%s' "$new" | tr ',' '\n' | grep -c .)" ;;
-  esac
+  for rule in "$RULE_UUID" "${STEAM_RULES[@]}"; do
+    case ",$cur," in *",$rule,"*) : ;; *) cur="${cur:+$cur,}$rule" ;; esac
+  done
+  kwriteconfig6 --file kwinrulesrc --group General --key rules "$cur"
+  kwriteconfig6 --file kwinrulesrc --group General --key count \
+    "$(printf '%s' "$cur" | tr ',' '\n' | grep -c .)"
   qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
 fi
 

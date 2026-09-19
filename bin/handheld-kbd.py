@@ -66,6 +66,8 @@ DEFAULT_CONFIG = {
     # Steam's own OSK. "custom" uses `geometry`, which is what the lock key writes after
     # you drag the keyboard somewhere. The reset key (kind "reset") goes back to "bottom".
     "position_mode": "bottom",
+    "dock_bottom_margin": 0,     # logical pixels above KWin's usable bottom edge
+    "debug": False,             # geometry/trigger diagnostics, never typed keys or text
     # Keyboard-size cycle (the size key): four steps, 1x-4x, each a larger fraction of
     # the panel height. The size key is labelled 1x/2x/3x/4x (no arrow glyphs).
     # Kept modest so even 4x fits a handheld panel without the split clusters or the top
@@ -449,6 +451,9 @@ class OSK(Gtk.Window):
         self.opacity_btn = None
         self.move_btn = None
         self.reported_rect = None      # where KWin last said our window is (free-move)
+        self._pending_geometry = None
+        self._drag = None
+        self._finishing_move = False
         self.hide_cb = None            # set by main(); keeps the hide path single-sourced
         # size_level (0 Normal / 1 Big / 2 Bigger) is the source of truth; start_big is a
         # derived boolean mirror the KWin-script and swap daemon still read. Seed from
@@ -461,7 +466,7 @@ class OSK(Gtk.Window):
             self._persist("start_big", self.size_level >= 1)
         # Live Shift preview: repaint keys to their shifted glyph while Shift is held.
         self.shift_preview = bool(config.get("shift_preview", True))
-        # Unlocked = KWin's rule is on Remember, so the user can drag/resize by hand.
+        # Unlocked = the KWin helper accepts drag/resize requests instead of docking.
         # Always starts locked; an unlocked keyboard that got respawned would drift.
         self.unlocked = False
         self.handle = None
@@ -653,6 +658,8 @@ class OSK(Gtk.Window):
         self.set_decorated(False)
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
         self.set_keep_above(True)
         g = config["geometry"]
         self.set_default_size(g["w"], g["h"])
@@ -904,7 +911,7 @@ class OSK(Gtk.Window):
         return (float(res[-2]), float(res[-1]))
 
     def _swipe_feed(self, ev):
-        if self.swipe is None:
+        if self.swipe is None or self.unlocked:
             return
         t = ev.type
         if t in (Gdk.EventType.TOUCH_BEGIN, Gdk.EventType.BUTTON_PRESS):
@@ -1176,7 +1183,8 @@ class OSK(Gtk.Window):
     def _placement_key(self):
         """Everything a placement depends on. Compared to skip needless compositor work."""
         outs = self._outputs()
-        return (self.big, self.unlocked, self.cfg.get("position_mode", "bottom"),
+        return (self.size_level, self.unlocked, self.cfg.get("position_mode", "bottom"),
+                self.cfg.get("dock_bottom_margin", 0),
                 json.dumps(self.cfg.get("geometry", {}), sort_keys=True),
                 tuple((o["name"], o["x"], o["y"], o["w"], o["h"]) for o in outs))
 
@@ -1186,6 +1194,8 @@ class OSK(Gtk.Window):
         Called on every show. Re-running the full path each time meant a kwriteconfig write,
         a KWin reconfigure and a script reload before the keyboard could appear, which is
         the slowest possible way to answer a button press."""
+        if self.unlocked or self._finishing_move:
+            return
         key = self._placement_key()
         if not force and key == getattr(self, "_placed_key", None):
             return
@@ -1220,7 +1230,9 @@ class OSK(Gtk.Window):
         # the per-row allocation and distort the grid). Game Mode has no window resize,
         # so there big_key_h is what actually grows the docked strip.
         kh = self.cfg.get("big_key_h", 100) if (big and GAMEMODE) else self.norm_kh
-        g = (self.cfg.get("big_geometry", DEFAULT_CONFIG["big_geometry"])
+        g = (self.cfg.get("geometry", DEFAULT_CONFIG["geometry"])
+             if self.cfg.get("position_mode") == "custom" else
+             self.cfg.get("big_geometry", DEFAULT_CONFIG["big_geometry"])
              if big else self.cfg.get("geometry", DEFAULT_CONFIG["geometry"]))
         rect = None
         if not GAMEMODE:
@@ -1230,6 +1242,10 @@ class OSK(Gtk.Window):
             # bottom hangs off the screen. It also means the keyboard occupies the same
             # fraction of the display on a 800px panel as on a 1200px one.
             rect = self._slot_rect(g, big)
+            if self.unlocked and self.get_realized():
+                # Reserve the handle inside the existing compositor allocation; adding
+                # its height to the key minimum would otherwise resize the whole window.
+                rect = dict(rect, w=self.get_allocated_width(), h=self.get_allocated_height())
             # The suggestion row eats into that height. apply_size() also runs before the
             # window is realised, where the row measures as ~0 — so trust the configured
             # height (plus its margins) and only prefer the measured value once it is real.
@@ -1264,10 +1280,12 @@ class OSK(Gtk.Window):
         if GAMEMODE:
             return
         rect = rect or self._slot_rect(g, big)
-        self.resize(rect["w"], rect["h"])
-        self.move(rect["x"], rect["y"])
         if self.unlocked:                    # the user is placing it by hand
             return
+        # The initial size is only a GTK hint. Once mapped, KWin owns the geometry;
+        # client resize requests would race the compositor during a drag or restore.
+        if not self.get_realized():
+            self.set_default_size(rect["w"], rect["h"])
         # The KWin script is the only thing that positions the window — in both docked and
         # custom modes. A window rule doing it too meant two authorities re-asserting
         # different rects, which is why a dragged keyboard jumped back a second later.
@@ -1340,12 +1358,7 @@ class OSK(Gtk.Window):
 
     # ---- Unlock / drag / lock ----
     def _set_rule_mode(self, mode):
-        """Set our KWin rule's position/size mode: 2 = Force, 4 = Remember.
-
-        Forced is the normal state — it keeps the keyboard docked and stops anything
-        nudging it. Remember lets the user drag and resize it freely, and KWin writes
-        wherever they leave it straight back into kwinrulesrc, which is how we read the
-        result afterwards (a Wayland client can't ask where its own window is)."""
+        """Disable old forced/remembered geometry; the KWin helper owns placement."""
         rid = self.cfg.get("kwin_rule_id", "")
         if not rid:
             return False
@@ -1376,7 +1389,7 @@ class OSK(Gtk.Window):
                     '    var g = w.frameGeometry;\n'
                     '    callDBus("org.handheld.Keyboard", "/org/handheld/Keyboard",\n'
                     '             "org.handheld.Keyboard", "SetGeometry",\n'
-                    '             "" + g.x + "," + g.y + "," + g.width + "," + g.height);\n'
+                    '             "final:" + g.x + "," + g.y + "," + g.width + "," + g.height);\n'
                     '  }\n});\n')
             S = "org.kde.kwin.Scripting."
             name = "handheld-kbd-report"
@@ -1387,15 +1400,59 @@ class OSK(Gtk.Window):
             print(f"handheld-kbd: geometry request failed ({ex})", file=sys.stderr)
 
     def set_reported_geometry(self, rect):
-        """KWin telling us where our window actually is, as "x,y,w,h" (logical pixels)."""
+        """KWin's logical frame; a final: prefix acknowledges the Done snapshot."""
+        final = rect.startswith("final:")
+        if final:
+            rect = rect[6:]
         try:
-            x, y, w, h = (int(v) for v in rect.split(","))
-        except Exception:
+            x, y, w, h = (int(round(float(v))) for v in rect.split(","))
+        except (ValueError, TypeError):
+            self._debug("invalid geometry report from KWin")
             return
         if w >= 160 and h >= 80:
-            if self.reported_rect is None:
-                print(f"handheld-kbd: KWin reports geometry {x},{y} {w}x{h}", file=sys.stderr)
-            self.reported_rect = {"x": x, "y": y, "w": w, "h": h}
+            self._debug(f"geometry changed: {x},{y} {w}x{h}")
+            geometry = {"x": x, "y": y, "w": w, "h": h}
+            if geometry != self.reported_rect:
+                self._geometry_changed_at = time.monotonic()
+            self.reported_rect = geometry
+            if final and self._finishing_move:
+                self._final_geometry_received = True
+
+    def _debug(self, message):
+        if self.cfg.get("debug") or os.environ.get("HANDHELD_KBD_DEBUG") == "1":
+            print(f"handheld-kbd: {message}", file=sys.stderr)
+
+    def next_geometry(self):
+        """The helper reads only while unlocked, coalescing motion to one frame."""
+        rect, self._pending_geometry = self._pending_geometry, None
+        return json.dumps(rect) if rect else ""
+
+    def _prepare_hhd_trigger(self, start):
+        """Protect Steam's first map before the direct M1 listener becomes ready."""
+        import configparser
+        rules = ["6c4263a8-3263-4d41-85f7-75c704113ed" + suffix for suffix in "bcd"]
+        try:
+            config = configparser.ConfigParser(interpolation=None, strict=False)
+            config.read(os.path.expanduser("~/.config/kwinrulesrc"))
+            # Never enable an absent rule: an empty rule could match every window.
+            for rule in rules:
+                if (not config.has_section(rule)
+                        or not config[rule].get("Description", "").startswith("Better Handheld Keyboard")
+                        or not config[rule].get("wmclass")):
+                    raise RuntimeError("Steam keyboard rules are missing; rerun install.sh")
+            for rule in rules:
+                for key in ("acceptfocusrule", "opacityactiverule", "opacityinactiverule"):
+                    subprocess.run(["kwriteconfig6", "--file", "kwinrulesrc", "--group", rule,
+                                    "--key", key, "2"], check=True, timeout=3)
+            subprocess.run(["qdbus6", "org.kde.KWin", "/KWin", "reconfigure"],
+                           check=True, timeout=3)
+        except Exception as ex:
+            print(f"handheld-kbd: HHD trigger protection unavailable ({ex}); using mirror fallback", file=sys.stderr)
+            return False
+        # KWin's reconfigure DBus method queues its rule reload; give that timer time
+        # to run before the listener can advertise readiness or process an M1 event.
+        GLib.timeout_add(300, lambda: (start(), False)[1])
+        return True
 
     def _reload_kwin_script(self, report=False):
         """Regenerate the KWin script and reload it. The script reads the dock settings out
@@ -1447,17 +1504,25 @@ class OSK(Gtk.Window):
             # gamescope draws us as a fullscreen overlay — there is no window to drag.
             print("handheld-kbd: move/lock is Desktop Mode only", file=sys.stderr)
             return
+        if self._finishing_move:
+            return
         self.unlocked = not self.unlocked
         if self.unlocked:
+            self._debug("KWin movement requested")
+            self._pending_geometry = None
             self.reported_rect = None
             self._set_rule_mode(1)              # DontAffect: nothing pins it while dragging
             self._reload_kwin_script(report=True)   # script stops placing, starts reporting
+            self.apply_size()                 # make room for the handle without resizing
         else:
             # Leaving free-move must never move the window. Ask KWin where it is, give the
             # reply a moment to land (the main loop has to stay free to receive it), then
             # pin it exactly there.
-            self.reported_rect = None     # never finish on a value from before the drag
-            self.request_geometry()
+            self._finishing_move = True
+            self._final_geometry_received = False
+            self._drag = None
+            # Let the helper consume the last queued motion before taking the snapshot.
+            GLib.timeout_add(60, self._request_final_geometry)
             self._finish_tries = 0
             # Wait for the answer instead of guessing how long it takes. A fixed delay was
             # a race: when the reply landed late we had already given up, and giving up
@@ -1465,13 +1530,27 @@ class OSK(Gtk.Window):
             GLib.timeout_add(100, self._finish_move)
         self._apply_handle()
 
+    def _request_final_geometry(self):
+        if not self._finishing_move:
+            return False
+        if self._pending_geometry:
+            return True
+        self.reported_rect = None
+        self.request_geometry()
+        return False
+
     def _finish_move(self):
+        if not self._finishing_move:
+            return False
         g = self.reported_rect
+        if (self._pending_geometry or not getattr(self, "_final_geometry_received", False)
+                or time.monotonic() - getattr(self, "_geometry_changed_at", 0) < 0.1):
+            g = None
         if not g:
             self._finish_tries = getattr(self, "_finish_tries", 0) + 1
             if self._finish_tries <= 20:          # up to ~2s, re-asking as we go
                 if self._finish_tries in (3, 7, 12, 17):
-                    self.request_geometry()
+                    self._request_final_geometry()
                 return True                       # keep waiting
             # No answer: freeze by doing nothing. Forcing the rect from kwinrulesrc here is
             # what used to yank the keyboard back to the dock, because that file still holds
@@ -1487,6 +1566,8 @@ class OSK(Gtk.Window):
             self._persist("position_mode", "free")
             self._reload_kwin_script(report=False)
             self._placed_key = None
+            self._pending_geometry = None
+            self._finishing_move = False
             return False
         # Stored exactly as KWin reports it, in absolute compositor coordinates, with no
         # clamping: a keyboard you moved by hand should stay where you put it, including
@@ -1497,8 +1578,10 @@ class OSK(Gtk.Window):
         # window, and would otherwise reload still thinking it should dock.
         self._persist("geometry", self.cfg["geometry"])
         self._persist("position_mode", "custom")
+        self._debug("geometry persisted: " + json.dumps(g))
         self._reload_kwin_script(report=False)
         self._placed_key = None
+        self._finishing_move = False
         return False
 
     def on_reset(self, btn):
@@ -1506,6 +1589,9 @@ class OSK(Gtk.Window):
         if self._stray_tap():
             return
         self.unlocked = False
+        self._finishing_move = False
+        self._drag = None
+        self._pending_geometry = None
         self.cfg["position_mode"] = "bottom"
         self._persist("position_mode", "bottom")
         self._last_rect = None
@@ -1529,42 +1615,78 @@ class OSK(Gtk.Window):
     def _build_handle(self):
         """A thin bar: drag anywhere along it to move, use either end to resize.
 
-        A Wayland client can't place itself, so both gestures hand off to the compositor
-        (begin_move_drag / begin_resize_drag) — the same mechanism a titlebar uses."""
+        GTK tracks the touch/mouse sequence; the KWin helper applies logical geometry.
+        GTK3 begin_move_drag relies on a valid input serial, which is missing for some
+        touch-emulated button events on Wayland."""
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         bar.set_size_request(-1, int(self.cfg.get("handle_height", 30)))
 
         def grip(edge, label):
             ev = Gtk.EventBox()
             ev.add(Gtk.Label(label=label))
-            ev.get_style_context().add_class("handle-grip")
-            ev.connect("button-press-event", self._on_resize_press, edge)
+            ev.get_style_context().add_class("handle-drag" if edge == "move" else "handle-grip")
+            drag = Gtk.GestureDrag.new(ev)
+            drag.set_button(1)
+            drag.connect("drag-begin", self._on_drag_begin, edge)
+            drag.connect("drag-update", self._on_drag_update)
+            drag.connect("drag-end", self._on_drag_end)
+            ev._drag_gesture = drag
             return ev
 
-        drag = Gtk.EventBox()
-        drag.add(Gtk.Label(label="drag to move  ·  ✓ when done  ·  ⤓ reset position"))
-        drag.get_style_context().add_class("handle-drag")
-        drag.connect("button-press-event", self._on_drag_press)
-        bar.pack_start(grip(Gdk.WindowEdge.NORTH_WEST, "⤡"), False, False, 0)
-        bar.pack_start(drag, True, True, 0)
-        bar.pack_start(grip(Gdk.WindowEdge.NORTH_EAST, "⤢"), False, False, 0)
+        bar.pack_start(grip("nw", "⤡"), False, False, 0)
+        bar.pack_start(grip("move", "drag to move  ·  ✓ when done  ·  ⤓ reset position"), True, True, 0)
+        bar.pack_start(grip("ne", "⤢"), False, False, 0)
         return bar
 
-    def _on_drag_press(self, widget, event):
-        try:
-            self.begin_move_drag(event.button, int(event.x_root), int(event.y_root),
-                                 event.time)
-        except Exception as ex:
-            print(f"handheld-kbd: move drag failed ({ex})", file=sys.stderr)
-        return True
+    def _on_drag_begin(self, gesture, x, y, edge):
+        if not self.unlocked or self._finishing_move:
+            return
+        if not self.reported_rect:
+            print("handheld-kbd: cannot move: KWin helper has not reported geometry", file=sys.stderr)
+            self.request_geometry()
+            return
+        pt = gesture.get_widget().translate_coordinates(self, int(x), int(y))
+        if not pt:
+            return
+        self._drag = {"edge": edge, "start": dict(self.reported_rect),
+                      "local": (pt[-2], pt[-1]), "widget": (x, y)}
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self._debug("movement started: " + edge)
 
-    def _on_resize_press(self, widget, event, edge):
-        try:
-            self.begin_resize_drag(edge, event.button, int(event.x_root),
-                                   int(event.y_root), event.time)
-        except Exception as ex:
-            print(f"handheld-kbd: resize drag failed ({ex})", file=sys.stderr)
-        return True
+    def _on_drag_update(self, gesture, dx, dy):
+        drag = self._drag
+        if not drag or not self.reported_rect:
+            return
+        sx, sy = drag["widget"]
+        pt = gesture.get_widget().translate_coordinates(self, int(sx + dx), int(sy + dy))
+        if not pt:
+            return
+        # Wayland's x_root/y_root are surface-local, not desktop coordinates. Translate
+        # the CURRENT event into the toplevel and add KWin's actual frame origin. Using
+        # the original origin or accumulating GTK offsets makes a moved surface jump.
+        current, start = self.reported_rect, drag["start"]
+        ax, ay = drag["local"]
+        px, py = current["x"] + pt[-2], current["y"] + pt[-1]
+        rect = dict(start)
+        if drag["edge"] == "move":
+            rect["x"], rect["y"] = px - ax, py - ay
+        else:
+            dx, dy = px - start["x"] - ax, py - start["y"] - ay
+            rect["h"] = max(120, start["h"] - dy)
+            rect["y"] = start["y"] + start["h"] - rect["h"]
+            if drag["edge"] == "nw":
+                rect["w"] = max(320, start["w"] - dx)
+                rect["x"] = start["x"] + start["w"] - rect["w"]
+            else:
+                rect["w"] = max(320, start["w"] + dx)
+        self._pending_geometry = rect
+
+    def _on_drag_end(self, gesture, dx, dy):
+        if self._drag:
+            # Wayland touch-up has no new coordinates. Reusing the last local offset
+            # after the compositor moved would apply that displacement a second time.
+            self._debug("movement finished")
+            self._drag = None
 
     def _clamp_rect(self, rect, out):
         """Keep a rect inside `out`, whatever the resolution.
@@ -1593,7 +1715,8 @@ class OSK(Gtk.Window):
                "huge_height_frac", "mega_height_frac"][self.size_level]
         frac = float(self.cfg.get(key, DEFAULT_CONFIG[key]))
         h = max(120, min(int(round(out["h"] * frac)), out["h"]))
-        return {"x": out["x"], "y": out["y"] + out["h"] - h, "w": out["w"], "h": h}
+        margin = max(0, min(int(self.cfg.get("dock_bottom_margin", 0)), out["h"] - h))
+        return {"x": out["x"], "y": out["y"] + out["h"] - h - margin, "w": out["w"], "h": h}
 
     def _slot_rect(self, g, big=False):
         """Where the window goes: the bottom dock by default, or the position the user
@@ -1682,13 +1805,10 @@ class OSK(Gtk.Window):
         self.hide()
 
     def _dismiss_steam_osk(self):
-        """Unmap Steam's OSK, once, in the background so the hide stays instant."""
-        script = (
-            'for w in $(xwininfo -root -tree 2>/dev/null | grep -i "$1" '
-            '| grep -oE "0x[0-9a-f]+"); do xdotool windowunmap "$w" 2>/dev/null; done')
+        """Close Steam's OSK through the shared KWin matcher without blocking hide."""
         try:
-            subprocess.Popen(["sh", "-c", script, "sh", "Steam Input On-screen Keyboard"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen([os.path.expanduser("~/.local/bin/handheld-kbd-fix-pointer")],
+                             stdout=subprocess.DEVNULL)
         except Exception as ex:
             print(f"handheld-kbd: could not dismiss Steam's OSK ({ex})", file=sys.stderr)
 
@@ -1749,6 +1869,15 @@ SERVICE_XML = """
     <method name='SetGeometry'>
       <arg type='s' name='rect' direction='in'/>
     </method>
+    <method name='NextGeometry'>
+      <arg type='s' name='rect' direction='out'/>
+    </method>
+    <method name='WindowDiagnostics'>
+      <arg type='s' name='windows' direction='in'/>
+    </method>
+    <method name='GetTrigger'>
+      <arg type='s' name='trigger' direction='out'/>
+    </method>
   </interface>
 </node>
 """
@@ -1756,7 +1885,8 @@ SERVICE_XML = """
 _service_keepalive = []
 
 
-def setup_service(show, hide, toggle, set_geometry=None, free_move=None, reset=None):
+def setup_service(show, hide, toggle, set_geometry=None, free_move=None, reset=None,
+                  next_geometry=None, ready=None):
     """Expose Show/Hide/Toggle on the session bus.
 
     This is what replaced polling. The KWin script calls these the moment Steam's
@@ -1766,17 +1896,35 @@ def setup_service(show, hide, toggle, set_geometry=None, free_move=None, reset=N
     from gi.repository import Gio
     handlers = {"Show": show, "Hide": hide, "Toggle": toggle,
                 "FreeMove": free_move, "Reset": reset}
+    registered = [False]
+    started = [False]
 
     def on_call(conn, sender, path, iface, method, params, invocation):
         try:
             if method == "SetGeometry" and set_geometry is not None:
                 set_geometry(params.unpack()[0])
+            elif method == "NextGeometry":
+                invocation.return_value(GLib.Variant("(s)", (next_geometry() if next_geometry else "",)))
+                return
+            elif method == "GetTrigger":
+                from handheld_kbd_backend import hhd_trigger_ready
+                invocation.return_value(GLib.Variant("(s)", ("ally-m1" if hhd_trigger_ready() else "",)))
+                return
+            elif method == "WindowDiagnostics":
+                data = json.loads(params.unpack()[0])
+                path = (os.path.join(os.environ["XDG_RUNTIME_DIR"], "handheld-kbd-windows.json")
+                        if os.environ.get("XDG_RUNTIME_DIR") else f"/tmp/handheld-kbd-{os.getuid()}-windows.json")
+                with open(path + ".tmp", "w") as f:
+                    json.dump(data, f)
+                os.replace(path + ".tmp", path)
             else:
                 fn = handlers.get(method)
                 if fn is not None:
                     fn()
         except Exception as ex:
             print(f"handheld-kbd: {method} failed ({ex})", file=sys.stderr)
+            invocation.return_dbus_error("org.handheld.Keyboard.Error", str(ex))
+            return
         invocation.return_value(None)
 
     def on_acquired(conn, name, _user=None):   # GLib calls this with 2 args
@@ -1785,13 +1933,18 @@ def setup_service(show, hide, toggle, set_geometry=None, free_move=None, reset=N
             # register_object() is deprecated in newer PyGObject; the *_with_closures form
             # is the replacement but doesn't exist everywhere yet.
             reg = getattr(conn, "register_object_with_closures", None) or conn.register_object
-            reg("/org/handheld/Keyboard", node.interfaces[0], on_call)
+            registered[0] = bool(reg("/org/handheld/Keyboard", node.interfaces[0], on_call))
         except Exception as ex:
             print(f"handheld-kbd: service registration failed ({ex})", file=sys.stderr)
 
+    def on_named(conn, name, _user=None):
+        if registered[0] and ready is not None and not started[0]:
+            started[0] = True
+            ready()
+
     try:
         oid = Gio.bus_own_name(Gio.BusType.SESSION, "org.handheld.Keyboard",
-                               Gio.BusNameOwnerFlags.REPLACE, on_acquired, None, None)
+                               Gio.BusNameOwnerFlags.REPLACE, on_acquired, on_named, None)
         _service_keepalive.append(oid)
     except Exception as ex:
         print(f"handheld-kbd: could not own the service name ({ex})", file=sys.stderr)
@@ -2128,17 +2281,31 @@ def main():
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, _hide, None)
 
     def _toggle():
+        w._debug("toggle requested")
         (_hide if state["shown"] else _show)()
 
     def _focus_show():
         if not state["shown"]:            # show-only, idempotent (no auto-hide)
             _show()
 
-    # KWin talks to us here; FreeMove/Reset are the same actions as the ✥ and ⤓ keys, so
-    # they can be scripted or bound to a shortcut.
+    def _setup_input_backend():
+        if GAMEMODE:
+            return
+        from handheld_kbd_backend import detect_backend, setup_hhd_trigger
+        backend = detect_backend(config)
+        w._debug("backend detection: " + backend["backend"])
+        if backend["trigger"] == "inputplumber":
+            setup_dbus_trigger(config, _toggle)
+        elif backend["trigger"] == "ally-m1":
+            w._prepare_hhd_trigger(lambda: setup_hhd_trigger(config))
+
+    # Direct triggers start only after our DBus service owns its name. HHD also needs
+    # the pre-map Steam focus rules enabled before it can send its first Toggle.
     setup_service(_show, _hide, _toggle, w.set_reported_geometry,
-                  lambda: w.on_move(None), lambda: w.on_reset(None))
-    setup_dbus_trigger(config, _toggle)   # seamless hardware-button trigger (InputPlumber)
+                  lambda: w.on_move(None), lambda: w.on_reset(None), w.next_geometry,
+                  _setup_input_backend)
+    if GAMEMODE:
+        setup_dbus_trigger(config, _toggle)
     setup_hotkey(config, _toggle)         # optional evdev hotkey (attached kbd / Steam Input chord)
     setup_focus_trigger(config, _focus_show)  # optional: auto-show when a text field is focused
     setup_gesture(config, _focus_show)        # optional: swipe up from bottom edge to summon
@@ -2147,7 +2314,7 @@ def main():
     # config write, a KWin reconfigure and a script reload, which is ~300ms the user should
     # never wait for.
     GLib.idle_add(lambda: (w.ensure_placed(), False)[1])
-    _setvis("1" if os.environ.get("HANDHELD_KBD_SHOW") == "1" else "0")
+    _setvis("0")
     if os.environ.get("HANDHELD_KBD_SHOW") == "1":
         _show()
     Gtk.main()

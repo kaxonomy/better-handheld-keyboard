@@ -41,6 +41,7 @@ DEFAULTS = {
     "gesture_summon": False, "size_level": 0, "mirror": True, "split": False,
     "layout": "full", "position_mode": "bottom", "color_theme": "midnight",
     "shift_preview": True,
+    "dock_bottom_margin": 0,
     "suggestion_count": 3, "gesture_fingers": 2, "super_icon": "windows",
 }
 
@@ -64,6 +65,7 @@ BOOL_SETTINGS = [
 CHOICE_SETTINGS = [
     ("layout",           "Layout",          "str", None),
     ("position_mode",    "Position",        "str", [("bottom", "Bottom"), ("custom", "Custom")]),
+    ("dock_bottom_margin", "Bottom margin", "int", [(0, "0 px"), (20, "20 px"), (40, "40 px"), (60, "60 px"), (80, "80 px")]),
     ("suggestion_count", "Suggestions",     "int", [(2, "2"), (3, "3"), (4, "4"), (5, "5")]),
     ("gesture_fingers",  "Gesture fingers", "int", [(1, "1 finger"), (2, "2 fingers")]),
     ("super_icon",       "Super key icon",  "str", [("windows", "Windows"), ("arch", "Arch"), ("tux", "Tux")]),
@@ -90,7 +92,7 @@ SECTION_BASE = 40          # group i's header id is SECTION_BASE + i
 GROUP_SEP_BASE = 30        # the separator before group i (i>0) is GROUP_SEP_BASE + i
 SETTINGS_GROUPS = [
     ("Typing",              ["prediction", "predict_learn", "@suggestion_count", "swipe"]),
-    ("Layout & appearance", ["@layout", "@super_icon", "split", "@size_level", "@position_mode", "@color_theme", "shift_preview"]),
+    ("Layout & appearance", ["@layout", "@super_icon", "split", "@size_level", "@position_mode", "@dock_bottom_margin", "@color_theme", "shift_preview"]),
     ("Summoning & input",   ["mirror", "gesture_summon", "@gesture_fingers"]),
 ]
 

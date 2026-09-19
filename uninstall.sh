@@ -3,6 +3,8 @@
 # (delete it yourself if you want it gone).
 set -uo pipefail
 RULE_UUID="a8a95de3-82aa-4998-87c0-125fb8525143"
+STEAM_RULE_UUID="6c4263a8-3263-4d41-85f7-75c704113edb"
+STEAM_RULES=( "$STEAM_RULE_UUID" 6c4263a8-3263-4d41-85f7-75c704113edc 6c4263a8-3263-4d41-85f7-75c704113edd )
 say() { printf '\033[1;36m::\033[0m %s\n' "$*"; }
 
 say "Stopping running keyboard…"
@@ -35,24 +37,30 @@ rm -rf "$HOME/.local/lib/handheld-kbd"          # the bundled suggestion filter
 qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript handheld-kbd-opacity >/dev/null 2>&1 || true
 
 # restore the hardware keyboard button (we remapped it via InputPlumber)
-say "Restoring InputPlumber default profile…"
-for d in $(busctl --system tree org.shadowblip.InputPlumber 2>/dev/null \
+if [ -f /usr/share/inputplumber/profiles/default.yaml ] && command -v busctl >/dev/null 2>&1; then
+  for d in $(busctl --system tree org.shadowblip.InputPlumber 2>/dev/null \
            | grep -oE '/org/shadowblip/InputPlumber/CompositeDevice[0-9]+'); do
+  say "Restoring InputPlumber default profile…"
   busctl --system call org.shadowblip.InputPlumber "$d" \
     org.shadowblip.Input.CompositeDevice LoadProfilePath s \
     /usr/share/inputplumber/profiles/default.yaml 2>/dev/null
-done
+  done
+fi
 
 if command -v kwriteconfig6 >/dev/null 2>&1; then
   say "Removing KWin window rule…"
   cur="$(kreadconfig6 --file kwinrulesrc --group General --key rules 2>/dev/null)"
-  new="$(printf '%s' "$cur" | tr ',' '\n' | grep -vx "$RULE_UUID" | paste -sd, -)"
+  new="$cur"
+  for rule in "$RULE_UUID" "${STEAM_RULES[@]}"; do
+    new="$(printf '%s' "$new" | tr ',' '\n' | grep -vx "$rule" | paste -sd, -)"
+  done
   kwriteconfig6 --file kwinrulesrc --group General --key rules "$new"
   kwriteconfig6 --file kwinrulesrc --group General --key count \
     "$(printf '%s' "$new" | tr ',' '\n' | grep -c .)"
-  kwriteconfig6 --file kwinrulesrc --group "$RULE_UUID" --key Description "" 2>/dev/null
   # drop the rule group entirely
-  if command -v kwriteconfig6 >/dev/null; then kwriteconfig6 --file kwinrulesrc --group "$RULE_UUID" --delete-group 2>/dev/null || true; fi
+  for rule in "$RULE_UUID" "${STEAM_RULES[@]}"; do
+    kwriteconfig6 --file kwinrulesrc --group "$rule" --delete-group 2>/dev/null || true
+  done
   qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
 fi
 

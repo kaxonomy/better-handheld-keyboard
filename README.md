@@ -101,6 +101,112 @@ out and back in**.
 
 Prefer the terminal? `./install.sh`, then log out and back in.
 
+### ROG Ally X / Bazzite / HHD
+
+On an ASUS ROG Ally X (RC72LA) running Plasma 6 Desktop Mode, the keyboard detects
+the running controller service. HHD does not require an InputPlumber CLI or Steam
+Input. M1 toggles this keyboard directly; M2 keeps its HHD behaviour. Re-running
+`./install.sh` upgrades the programs and rules while preserving your settings.
+
+HHD's **Keyboard/Overlay** mode opens Steam's keyboard itself, even with Steam
+Input disabled. Its public API does not expose a separate M1 keyboard action.
+The HHD backend therefore reads F17 press/release events from the identified ASUS
+shortcut device without grabbing it or emitting any keys. HHD remains unchanged.
+A narrow KWin rule prevents known Steam OSK windows from taking focus or flashing;
+the KWin helper identifies and closes them using Steam identity and keyboard
+metadata. Mirror toggles are disabled while the direct M1 listener is ready, so
+the same press cannot toggle twice. Device discovery repeats after disconnects.
+This follows HHD's [Ally driver](https://github.com/hhd-dev/hhd/blob/master/src/hhd/device/rog_ally/base.py)
+and [paddle actions](https://github.com/hhd-dev/hhd/blob/master/src/hhd/controller/base.py);
+no HHD configuration or system files are changed.
+
+The nonexclusive listener does not consume the original hardware F17 event. It
+never re-injects F17, and does not watch F17 on unrelated keyboards. Avoid binding
+physical F17 to another desktop action on this device.
+
+Free movement uses touch/mouse gestures and KWin's logical `frameGeometry` through
+the keyboard's session DBus service. Docking is suspended while moving; Done saves
+the geometry reported by KWin. The helper restores that rectangle on later shows
+and restarts. Position rules no longer force a competing rectangle.
+The helper uses the [KWin 6 scripting API](https://develop.kde.org/docs/plasma/kwin/api/).
+
+To leave a gap above the usable bottom edge:
+
+```bash
+handheld-kbd-ctl set dock_bottom_margin 40 int
+```
+
+The default is 0 logical pixels. The setting applies to all docked sizes, respects
+display scaling and panels, and leaves custom positions alone. Large margins are
+limited to the available space. It is also in the tray's **Bottom margin** menu.
+The command restarts the keyboard; no logout is needed.
+
+From this fork's checkout, these are the update and diagnostic commands:
+
+```bash
+git pull --ff-only
+./install.sh
+# Log out and back in after the first install, or restart an existing session:
+handheld-kbd-ctl restart
+handheld-kbd-ctl status
+handheld-kbd-ctl windows
+```
+
+If you specifically need to remove a stale official installation first, run
+`./uninstall.sh` from this checkout, then `./install.sh`. Uninstall preserves
+`~/.config/handheld-kbd/` but removes the uinput rule, so reinstall may ask for a
+password. An ordinary upgrade needs only `./install.sh`.
+
+For trigger, movement and Steam window logging:
+
+```bash
+handheld-kbd-ctl set debug true bool
+tail -f /tmp/handheld-kbd-out.log /tmp/swap-startup.log
+# In another terminal, KWin logs:
+journalctl --user -f | grep HHKBD
+# Turn detailed logging off afterwards:
+handheld-kbd-ctl set debug false bool
+```
+
+`status` / `diagnostics` reports the backend, DMI, session, service readiness,
+selected M1 device, placement and live Steam window metadata without root. It
+does not log typed keys or text. Unmatched Steam windows omit their captions to
+avoid recording chat/browser text.
+
+Acceptance check on the handheld (Steam Input can stay disabled):
+
+1. Run `handheld-kbd-ctl diagnostics`. Confirm `input backend: hhd`,
+   `trigger: ally-m1`, an ASUS input device, and the keyboard/KWin services.
+2. Press M1 once to show, again to hide; hold it and repeat ten press/release cycles.
+   Each press must toggle once. Steam's OSK must not appear or take focus. Check M2
+   still opens its usual HHD overlay.
+3. Open Application Launcher, select search, press M1 and tap `test` on the
+   keyboard. The Launcher must remain open and receive it. Repeat in Konsole,
+   a Qt text field (KWrite), a GTK text field, and a browser text field.
+4. Tap ✥, drag the centre handle upward by touch, release, and tap ✓. Repeat with
+   a mouse and both resize grips. Run `handheld-kbd-ctl windows` and compare its
+   keyboard geometry with the saved geometry in `handheld-kbd-ctl status`.
+5. Hide/reopen, then run `handheld-kbd-ctl restart` and reopen. The custom rectangle
+   must remain. Repeat on a second display with different scaling if available.
+6. Run `handheld-kbd-ctl reset`, then set the bottom margin to 40 as above. Check
+   all four sizes: `handheld-kbd-ctl windows` should report `bottomMargin: 40`.
+7. Suspend/resume, repeat M1 show/hide, and inspect diagnostics for the selected
+   event device. No InputPlumber installation is needed.
+
+These hardware checks require an actual Plasma/Ally session. Unknown future Steam
+OSK metadata may require updating the matcher and pre-map rule; use `windows` to
+inspect it. Ordinary grabbed application popup menus can dismiss when touched
+outside their application; the Application Launcher focus test is separate.
+
+Local regression checks (Node.js is only needed for the KWin mock test):
+
+```bash
+python3 tools/test-backend.py
+python3 tools/test-movement.py
+python3 tools/test-install.py
+node tools/test-kwin.js
+```
+
 ## How it works
 
 ```

@@ -5,14 +5,14 @@
 # changed to F13 (everything else untouched), then loads it via DBus (no root needed).
 PROF=/tmp/handheld-kbd-ip.yaml
 DEFAULT=/usr/share/inputplumber/profiles/default.yaml
-[ -f "$DEFAULT" ] || exit 0
+[ -f "$DEFAULT" ] || exit 1
 # DBus event to remap the keyboard button to (matches config.json dbus_trigger).
 EVENT=$(python3 -c 'import json,os
 try: print(json.load(open(os.path.expanduser("~/.config/handheld-kbd/config.json"))).get("dbus_trigger") or "ui_osk")
 except Exception: print("ui_osk")' 2>/dev/null)
 EVENT=${EVENT:-ui_osk}
 
-python3 - "$DEFAULT" "$PROF" "$EVENT" <<'PY' || exit 0
+python3 - "$DEFAULT" "$PROF" "$EVENT" <<'PY' || exit 1
 import sys
 src = open(sys.argv[1]).read()
 old = """  - name: Keyboard

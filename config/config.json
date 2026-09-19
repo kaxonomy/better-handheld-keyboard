@@ -13,6 +13,7 @@
   ],
   "position_mode": "bottom",
   "dock_height_frac": 0.42,
+  "dock_bottom_margin": 0,
   "big_height_frac": 0.55,
   "big_key_h": 100,
   "start_big": false,

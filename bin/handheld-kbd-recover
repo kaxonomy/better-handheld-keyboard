@@ -20,7 +20,6 @@ export DISPLAY="${DISPLAY:-:0}"
 CFG="$HOME/.config/handheld-kbd/config.json"
 BIN="$HOME/.local/bin"
 OPSCRIPT="$HOME/.local/share/kwin/scripts/handheld-kbd-opacity/contents/code/main.js"
-NAME="Steam Input On-screen Keyboard"
 STOCK_ONLY=0
 [ "${1:-}" = "--stock-only" ] && STOCK_ONLY=1
 
@@ -36,6 +35,14 @@ pkill -f 'handheld-kbd-swap\.sh' 2>/dev/null && ok "stopped the swap daemon" || 
 # --- 2. unload the KWin script that hides Steam's keyboard ---
 qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript handheld-kbd-opacity >/dev/null 2>&1 \
     && ok "unloaded the KWin opacity script" || true
+if command -v kwriteconfig6 >/dev/null 2>&1; then
+    for rule in 6c4263a8-3263-4d41-85f7-75c704113ed{b,c,d}; do
+        for key in acceptfocusrule opacityactiverule opacityinactiverule; do
+            kwriteconfig6 --file kwinrulesrc --group "$rule" --key "$key" 0
+        done
+    done
+    qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
+fi
 
 # --- 3. restore InputPlumber's stock button mapping ---
 DEFAULT=/usr/share/inputplumber/profiles/default.yaml
@@ -53,12 +60,10 @@ fi
 
 # --- 4. un-hide any Steam keyboard window we made transparent, and drop the latch ---
 rm -f /tmp/handheld-kbd.suppress
-if command -v xwininfo >/dev/null 2>&1; then
-    for w in $(xwininfo -root -tree 2>/dev/null | grep -i "$NAME" | grep -oE '0x[0-9a-f]+'); do
-        xprop -id "$w" -remove _NET_WM_WINDOW_OPACITY 2>/dev/null
-        command -v xdotool >/dev/null 2>&1 && xdotool windowmap "$w" 2>/dev/null
-    done
-    ok "cleared the opacity override on Steam's keyboard"
+if [ -x "$BIN/handheld-kbd-fix-pointer" ]; then
+    "$BIN/handheld-kbd-fix-pointer" >/dev/null 2>&1 \
+        && ok "closed leftover Steam keyboard windows; they can reopen normally" \
+        || warn "could not close leftover Steam keyboard windows"
 fi
 
 if [ "$STOCK_ONLY" = 1 ]; then

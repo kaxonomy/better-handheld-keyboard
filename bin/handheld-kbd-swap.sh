@@ -1,10 +1,16 @@
 #!/bin/bash
 # Better Handheld Keyboard swap daemon (MIRROR, self-correcting). Ours mirrors Steam's OSK
 # visibility via /tmp/handheld-kbd.vis. Also loads the opacity KWin script at start.
-export DISPLAY=:0
-NAME="Steam Input On-screen Keyboard"
-VIS=/tmp/handheld-kbd.vis
+export DISPLAY="${DISPLAY:-:0}"
 KBD="$HOME/.local/bin/handheld-kbd.py"
+BACKEND="$HOME/.local/bin/handheld_kbd_backend.py"
+detect_input() {
+    python3 "$BACKEND" --json | python3 -c 'import json,sys
+d=json.load(sys.stdin); print(d["backend"], d["trigger"])'
+}
+read -r INPUT_BACKEND INPUT_TRIGGER < <(detect_input)
+INPUT_BACKEND=${INPUT_BACKEND:-generic}
+INPUT_TRIGGER=${INPUT_TRIGGER:-mirror}
 
 # Mirror Steam's OSK by default (hardware keyboard-button trigger). Set "mirror": false
 # in config.json to instead drive the keyboard with a controller chord / hotkey — then
@@ -13,6 +19,12 @@ MIRROR=$(python3 -c 'import json,os
 try: print(0 if json.load(open(os.path.expanduser("~/.config/handheld-kbd/config.json"))).get("mirror", True) is False else 1)
 except Exception: print(1)' 2>/dev/null)
 [ "$MIRROR" = 0 ] || MIRROR=1
+CONFIG_MIRROR=$MIRROR
+LOCAL_TRIGGER=$(python3 -c 'import json,os
+try:
+    d=json.load(open(os.path.expanduser("~/.config/handheld-kbd/config.json")))
+    print(1 if d.get("hotkey") or d.get("gesture_summon") else 0)
+except Exception: print(0)' 2>/dev/null)
 
 exec 9>/tmp/handheld-kbd-swap.lock
 flock -n 9 || exit 0
@@ -32,7 +44,41 @@ case "$OP" in ''|*[!0-9.]*) OP=0.72 ;; esac
 # Steam's keyboard alone: a trigger that never fires must degrade to "the stock keyboard",
 # never to "no keyboard at all". (That was the Legion Go 1 case — InputPlumber's default
 # profile carries a 'Keyboard' button mapping on every device, but no Go 1 button emits it.)
-hide_steam_wanted() { { [ "$MIRROR" = 1 ] || [ -f "$PROVEN" ]; } && echo 1 || echo 0; }
+KEYBOARD_READY=0
+refresh_keyboard_ready() {
+    KEYBOARD_READY=0
+    busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus NameHasOwner s org.handheld.Keyboard \
+        2>/dev/null | grep -q true && KEYBOARD_READY=1
+}
+hide_steam_wanted() { { [ "$KEYBOARD_READY" = 1 ] && { [ "$MIRROR" = 1 ] || [ "$INPUT_TRIGGER" = ally-m1 ] || [ -f "$PROVEN" ]; }; } && echo 1 || echo 0; }
+
+# XWayland focus happens before windowAdded, so the script alone cannot prevent Steam
+# dismissing a launcher. Enable this narrow rule only while our keyboard is available.
+STEAM_RULE_UUID="6c4263a8-3263-4d41-85f7-75c704113edb"
+STEAM_RULES=( "$STEAM_RULE_UUID" 6c4263a8-3263-4d41-85f7-75c704113edc 6c4263a8-3263-4d41-85f7-75c704113edd )
+STEAM_RULE_MODE=""
+steam_rule_mode() {
+    [ "$STEAM_RULE_MODE" != "$1" ] || return
+    command -v kwriteconfig6 >/dev/null 2>&1 || return
+    for rule in "${STEAM_RULES[@]}"; do
+        for key in acceptfocusrule opacityactiverule opacityinactiverule; do
+            kwriteconfig6 --file kwinrulesrc --group "$rule" --key "$key" "$1"
+        done
+    done
+    qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
+    STEAM_RULE_MODE=$1
+}
+trap 'steam_rule_mode 0; qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript handheld-kbd-opacity >/dev/null 2>&1 || true' EXIT
+trap 'exit 0' TERM INT
+
+update_steam_rule() {
+    if [ "$(hide_steam_wanted)" = 1 ]; then
+        steam_rule_mode 2
+    else
+        steam_rule_mode 0
+    fi
+}
 
 # One writer for the KWin script (shared with the installer and the keyboard's opacity
 # key) so the file can never diverge from what those two expect to find in it.
@@ -47,11 +93,32 @@ load_opscript() {
     qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start >/dev/null 2>&1
 }
 
+FALLBACK=/tmp/handheld-kbd.mirror-fallback
+set_trigger_mode() {
+    rm -f "$FALLBACK"
+    MIRROR=$CONFIG_MIRROR
+    SEAMLESS_WANTED=0
+    if [ "$INPUT_TRIGGER" = ally-m1 ]; then
+        # GetTrigger in the live KWin helper skips mirroring while direct M1 is ready.
+        # Keep its fallback available if input permissions or a reconnect delay capture.
+        MIRROR=1
+        : > "$FALLBACK"
+    elif [ "$INPUT_BACKEND" = inputplumber ] && [ "$MIRROR" = 0 ]; then
+        SEAMLESS_WANTED=1
+    elif [ "$INPUT_TRIGGER" = mirror ] && [ "$MIRROR" = 0 ] && [ "$LOCAL_TRIGGER" != 1 ]; then
+        # Repair the old unsupported-device seamless mode for this session, preserving
+        # the user's config and intentional hotkey/gesture-only setups.
+        MIRROR=1
+        : > "$FALLBACK"
+    fi
+}
+set_trigger_mode
+refresh_keyboard_ready
 HIDE_STEAM=$(hide_steam_wanted)
 write_opscript "$HIDE_STEAM"
 
 {
-  echo "STARTUP $(date) OPSCRIPT=$OPSCRIPT exists=$([ -f "$OPSCRIPT" ] && echo Y || echo N) opacity=$OP mirror=$MIRROR hide_steam=$HIDE_STEAM"
+  echo "STARTUP $(date) OPSCRIPT=$OPSCRIPT exists=$([ -f "$OPSCRIPT" ] && echo Y || echo N) opacity=$OP mirror=$MIRROR hide_steam=$HIDE_STEAM backend=$INPUT_BACKEND trigger=$INPUT_TRIGGER"
   load_opscript
 } >>/tmp/swap-startup.log 2>&1
 
@@ -61,11 +128,6 @@ write_opscript "$HIDE_STEAM"
 # The fallback is recorded in a file, not just a variable: the keyboard regenerates the
 # KWin script too (opacity key, placement changes) and would otherwise write MIRROR=0 back,
 # silently undoing the fallback while the trigger is still dead.
-FALLBACK=/tmp/handheld-kbd.mirror-fallback
-rm -f "$FALLBACK"
-SEAMLESS_WANTED=0
-[ "$MIRROR" = 0 ] && SEAMLESS_WANTED=1
-
 apply_remap() {          # 0 = the hardware button now drives us
     [ -x "$HOME/.local/bin/handheld-kbd-ip-remap" ] || return 1
     "$HOME/.local/bin/handheld-kbd-ip-remap" >>/tmp/swap-startup.log 2>&1
@@ -92,9 +154,31 @@ fi
 # and cheap. On a Steam Deck the old poll was a constant drip of processes competing with
 # Steam Input, which drives the trackpads.
 while true; do
+    # Controller daemons can start after Plasma or be restarted in place. Re-detect
+    # occasionally, then reopen the keyboard's subscriptions only when the stack changes.
+    backend_check=$((${backend_check:-0} + 1))
+    if [ "$backend_check" -ge 5 ]; then
+        backend_check=0
+        read -r detected detected_trigger < <(detect_input)
+        if [ -n "$detected" ] && { [ "$detected" != "$INPUT_BACKEND" ] || [ "$detected_trigger" != "$INPUT_TRIGGER" ]; }; then
+            echo "BACKEND CHANGED $(date) $INPUT_BACKEND/$INPUT_TRIGGER -> $detected/$detected_trigger" >>/tmp/swap-startup.log
+            INPUT_BACKEND=$detected
+            INPUT_TRIGGER=$detected_trigger
+            set_trigger_mode
+            REMAPPED=0
+            retry=4
+            pkill -f 'python3 .*handheld-kbd\.py' 2>/dev/null || true
+            HIDE_STEAM=$(hide_steam_wanted)
+            write_opscript "$HIDE_STEAM"
+            load_opscript
+        fi
+    fi
+    refresh_keyboard_ready
+    update_steam_rule
     # Self-heal: the KWin script's boot-time load can lose the race with KWin startup.
     if [ "$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.isScriptLoaded handheld-kbd-opacity 2>/dev/null)" != "true" ]; then
-        write_opscript "$(hide_steam_wanted)"
+        HIDE_STEAM=$(hide_steam_wanted)
+        write_opscript "$HIDE_STEAM"
         load_opscript
     else
         # Seamless mode: once the keyboard has proven it can appear we may start hiding

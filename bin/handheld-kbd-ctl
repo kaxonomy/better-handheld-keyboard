@@ -6,6 +6,8 @@
 # wedged Wayland connection, or a position you want to put back.
 #
 #   handheld-kbd-ctl status      what is running, and where the keyboard is
+#   handheld-kbd-ctl diagnostics include live KWin window metadata
+#   handheld-kbd-ctl windows     inspect Steam OSK and keyboard windows
 #   handheld-kbd-ctl start       start the supervisor (and so the keyboard)
 #   handheld-kbd-ctl stop        stop both; nothing respawns until you start it again
 #   handheld-kbd-ctl restart     stop, then start — the usual fix
@@ -65,6 +67,16 @@ stop_all() {
     done
     kill_pattern "$KBD_PAT" KILL
     rm -f /tmp/handheld-kbd-swap.lock
+    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript handheld-kbd-opacity >/dev/null 2>&1 || true
+    # The pre-map Steam OSK rule must stand down with the replacement keyboard.
+    if command -v kwriteconfig6 >/dev/null 2>&1; then
+        for rule in 6c4263a8-3263-4d41-85f7-75c704113ed{b,c,d}; do
+            for key in acceptfocusrule opacityactiverule opacityinactiverule; do
+                kwriteconfig6 --file kwinrulesrc --group "$rule" --key "$key" 0
+            done
+        done
+        qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
+    fi
 }
 
 start_all() {
@@ -87,20 +99,92 @@ start_all() {
     done
 }
 
+window_diagnostics() {
+    local js name="hhkbd-diagnostics-$$" report
+    report="$XDG_RUNTIME_DIR/handheld-kbd-windows.json"
+    [ -d "$XDG_RUNTIME_DIR" ] || report="/tmp/handheld-kbd-$(id -u)-windows.json"
+    if ! command -v qdbus6 >/dev/null 2>&1; then
+        echo "KWin windows: unavailable (qdbus6 not installed)"
+        return 1
+    fi
+    js=$(mktemp --suffix=.js) || return 1
+    if ! "$BIN/handheld-kbd-kwin-script" --diagnostics --out "$js"; then
+        rm -f "$js"
+        return 1
+    fi
+    rm -f "$report"
+    if qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$js" "$name" >/dev/null 2>&1 \
+       && qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start >/dev/null 2>&1; then
+        for _ in $(seq 20); do
+            [ -s "$report" ] && break
+            sleep 0.1
+        done
+    fi
+    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$name" >/dev/null 2>&1 || true
+    rm -f "$js"
+    if [ -s "$report" ]; then
+        python3 -m json.tool "$report"
+    else
+        echo "KWin windows: unavailable (KWin or keyboard DBus service did not answer)"
+        return 1
+    fi
+}
+
 case "${1:-restart}" in
-    status)
+    status|diagnostics)
         running "$SUP_PAT" && echo "supervisor: running" || echo "supervisor: stopped"
         running "$KBD_PAT" && echo "keyboard:   running" || echo "keyboard:   stopped"
         echo "visible:    $([ "$(cat /tmp/handheld-kbd.vis 2>/dev/null)" = 1 ] && echo yes || echo no)"
-        python3 - <<'PY' 2>/dev/null
-import json, os
+        python3 "$BIN/handheld_kbd_backend.py" --status
+        python3 - <<'PY'
+import json, os, re, shutil, subprocess
+
+def probe(args):
+    if not shutil.which(args[0]):
+        return "unavailable"
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=3)
+        return p.stdout.strip() if p.returncode == 0 else "unavailable"
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+
 p = os.path.expanduser("~/.config/handheld-kbd/config.json")
 try:
-    c = json.load(open(p))
-except Exception:
-    raise SystemExit
-print("position:   %s %s" % (c.get("position_mode", "bottom"), c.get("geometry", "")))
+    with open(p) as f:
+        c = json.load(f)
+except (OSError, ValueError) as ex:
+    print("config:     %s" % ex)
+    c = {}
+print("session:    %s (%s)" % (os.environ.get("XDG_SESSION_TYPE", "unknown"),
+                                os.environ.get("XDG_CURRENT_DESKTOP", "unknown")))
+print("Plasma:     %s" % probe(["plasmashell", "--version"]))
+print("DBus keyboard service: %s" % probe(["busctl", "--user", "call", "org.freedesktop.DBus",
+      "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", "s", "org.handheld.Keyboard"]))
+print("KWin helper loaded: %s" % probe(["qdbus6", "org.kde.KWin", "/Scripting",
+      "org.kde.kwin.Scripting.isScriptLoaded", "handheld-kbd-opacity"]))
+print("mirror setting: %s" % c.get("mirror", True))
+trigger = probe(["busctl", "--user", "call", "org.handheld.Keyboard", "/org/handheld/Keyboard",
+                 "org.handheld.Keyboard", "GetTrigger"])
+script = os.path.expanduser("~/.local/share/kwin/scripts/handheld-kbd-opacity/contents/code/main.js")
+try:
+    with open(script) as f:
+        generated = f.read()
+    for key, label in (("MIRROR", "mirror effective"), ("CLOSE_STEAM", "hide_steam")):
+        match = re.search(r"var " + key + r" = ([01]);", generated)
+        value = match.group(1) if match else "unknown"
+        if key == "MIRROR" and trigger == 's "ally-m1"':
+            value = "0 (direct M1 listener ready)"
+        print("%s: %s" % (label, value))
+except OSError:
+    print("hide_steam: unknown (helper not generated)")
+print("position:   %s" % c.get("position_mode", "bottom"))
+print("saved geometry: %s" % c.get("geometry", "none"))
+print("bottom margin: %s logical px" % c.get("dock_bottom_margin", 0))
 PY
+        window_diagnostics || true
+        ;;
+    windows)
+        window_diagnostics
         ;;
     stop)
         stop_all
@@ -200,9 +284,14 @@ try:
     c = json.load(open(p))
 except Exception:
     c = {}
-c[key] = coerce(val, typ)
+value = coerce(val, typ)
+if key == "dock_bottom_margin" and (type(value) is not int or value < 0):
+    raise SystemExit("dock_bottom_margin must be a non-negative integer in logical pixels")
+c[key] = value
 os.makedirs(os.path.dirname(p), exist_ok=True)
-json.dump(c, open(p, "w"), indent=2)
+with open(p + ".tmp", "w") as f:
+    json.dump(c, f, indent=2)
+os.replace(p + ".tmp", p)
 PY
         stop_all
         start_all
@@ -210,7 +299,7 @@ PY
             || { echo "$key set; keyboard did not come back — see /tmp/handheld-kbd-out.log" >&2; exit 1; }
         ;;
     *)
-        echo "usage: handheld-kbd-ctl [status|start|stop|restart|reset|super-icon <windows|arch|tux>|set <key> <value> [type]]" >&2
+        echo "usage: handheld-kbd-ctl [status|diagnostics|windows|start|stop|restart|reset|super-icon <windows|arch|tux>|set <key> <value> [type]]" >&2
         exit 2
         ;;
 esac
