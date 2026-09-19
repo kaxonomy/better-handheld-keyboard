@@ -109,7 +109,23 @@ else:
     assert "X-KDE-Wayland-VirtualKeyboard=true" in Path(provider).read_text()
     assert str(home / ".local/bin/handheld-kbd-input-method") in Path(provider).read_text()
     rules = json.loads(state.read_text())
+    assert rules["Wayland"] == previous_keyboard
+    # Explicit None (an empty provider) also survives a first install.
+    backup_path.unlink()
+    rules["Wayland"] = {"InputMethod": "", "VirtualKeyboardEnabled": "false"}
+    state.write_text(json.dumps(rules))
+    run("install.sh")
+    assert json.loads(state.read_text())["Wayland"] == rules["Wayland"]
+    # With no existing selection, first install enables our touch provider.
+    backup_path.unlink()
+    rules["Wayland"] = {}
+    state.write_text(json.dumps(rules))
+    run("install.sh")
+    rules = json.loads(state.read_text())
     assert rules["Wayland"] == {"InputMethod": provider, "VirtualKeyboardEnabled": "true", "VirtualKeyboardMode": "1"}
+    assert json.loads(backup_path.read_text()) == dict.fromkeys(backup)
+    # Retain the original provider to exercise recovery and uninstall restoration.
+    backup_path.write_text(json.dumps(backup))
     assert rules[RULE]["positionrule"] == rules[RULE]["sizerule"] == "0"
     assert rules[RULE]["layer"] == "osd" and rules[RULE]["layerrule"] == "2"
     assert rules[RULE]["acceptfocus"] == "false" and rules[RULE]["acceptfocusrule"] == "2"
@@ -217,6 +233,10 @@ test "$SEAMLESS_WANTED:$MIRROR" = 0:0 && test ! -f "$FALLBACK" || exit 4
 
     # Stock-only recovery also restores the prior touch provider and disables autostart.
     env["HHK_TEST_KWIN_PROPERTY"] = "mode"
+    run("install.sh")
+    rules = json.loads(state.read_text())
+    rules["Wayland"]["InputMethod"] = provider
+    state.write_text(json.dumps(rules))
     run("install.sh")
     recovery = base / "recover"
     recovery.write_text((ROOT / "bin/handheld-kbd-recover").read_text().replace(

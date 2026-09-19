@@ -307,14 +307,17 @@ def read(key):
     return None if value == missing else value
 
 current = read("InputMethod")
-if not os.path.exists(backup):
+upgrading = os.path.exists(backup)
+if not upgrading:
     previous = {key: read(key) for key in keys}
     if current == provider:
         previous["InputMethod"] = None
     with open(backup + ".tmp", "w") as f:
         json.dump(previous, f)
     os.replace(backup + ".tmp", backup)
-elif current != provider:
+# An empty value is Plasma's explicit None selection; only a missing key is unset.
+# Keep user choices on upgrades, even if the key was removed.
+if current != provider and (upgrading or current is not None):
     print("handheld-kbd: keeping your selected Plasma virtual keyboard; Better Handheld Keyboard is available in System Settings.")
     sys.exit(0)
 for key, value in zip(keys, (provider, "true", "1")):

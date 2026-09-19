@@ -439,10 +439,7 @@ def hhd_trigger_ready(device_path=None):
                for trigger in _keepalive)
 
 
-def setup_hhd_trigger(config, toggle):
-    info = detect_backend(config)
-    if info["trigger"] != "ally-m1":
-        return None
+def setup_hhd_trigger(info, config, toggle):
     print(f"handheld-kbd: input backend: {info['backend']}; device: {info['device']}; trigger: ally-m1", file=sys.stderr)
     try:
         from gi.repository import GLib

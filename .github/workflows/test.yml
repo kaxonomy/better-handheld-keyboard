@@ -101,10 +101,28 @@ jobs:
           start = next(i for i, l in enumerate(lines) if l.startswith("python3 - ") and "PY" in l)
           end = next(i for i in range(start + 1, len(lines)) if lines[i] == "PY")
           open(d + "/mig.py", "w").write("\n".join(lines[start + 1:end]))
-          subprocess.run(["python3", d + "/mig.py", os.path.abspath("config"), d], check=True)
+          subprocess.run(["python3", d + "/mig.py", os.path.abspath("config"), d, "1"], check=True)
           after = json.load(open(d + "/layouts/full.json"))
           assert any(k.get("key") == NEW for r in after["rows"] for k in r), \
               "upgrade did not add " + NEW
+          assert json.load(open(d + "/config.json"))["super_icon"] == "auto"
           print("upgrade adds", NEW)
           shutil.rmtree(d)
           PY
+
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install integration test libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-gi gir1.2-glib-2.0 libwayland-client0 dbus
+      - name: Controller, movement, installation, DBus, touch, and key checks
+        run: |
+          set -e
+          for name in backend movement install controls dbus input-method keys; do
+            /usr/bin/python3 "tools/test-$name.py"
+          done
+      - name: KWin window checks
+        run: node tools/test-kwin.js

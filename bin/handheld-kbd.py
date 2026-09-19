@@ -1376,17 +1376,6 @@ class OSK(Gtk.Window):
         outs.sort(key=lambda o: (not o["internal"], not o.get("primary"), o["x"], o["y"]))
         return outs
 
-    def _panel_origin(self):
-        """Logical origin (x,y) of the INTERNAL panel (eDP*), so we dock on the built-in
-        touchscreen even when an external display shifts the coordinate space (an external
-        at 0,0 would otherwise steal position 0,378). Returns (0,0) on a single display or
-        any failure — i.e. the original behaviour."""
-        outs = self._outputs()
-        if len(outs) < 2:
-            return (0, 0)                    # single display → no offset needed
-        m = next((o for o in outs if o["internal"]), None)
-        return (m["x"], m["y"]) if m else (0, 0)
-
     # ---- Unlock / drag / lock ----
     def _set_rule_mode(self, mode):
         """Disable old forced/remembered geometry; the KWin helper owns placement."""
@@ -1407,10 +1396,8 @@ class OSK(Gtk.Window):
     def request_geometry(self):
         """Ask KWin, right now, where our window is.
 
-        Relying on frameGeometryChanged alone is not enough: after a real interactive drag
-        the signal may not have been delivered by the time the user taps ✓, and then we
-        would fall back to reading kwinrulesrc — which still holds the OLD forced rect, so
-        the keyboard appears to jump home. This pushes the answer to us instead."""
+        Wait for a fresh compositor report before saving a move. The last geometry
+        signal can arrive after the user taps Done."""
         js = "/tmp/handheld-kbd-report.js"
         try:
             with open(js, "w") as f:
@@ -1508,24 +1495,6 @@ class OSK(Gtk.Window):
                                check=False, timeout=3)
         except Exception as ex:
             print(f"handheld-kbd: kwin script reload failed ({ex})", file=sys.stderr)
-
-    def _read_rule_geometry(self):
-        """What KWin remembered while we were unlocked: {"x","y","w","h"} or None."""
-        rid = self.cfg.get("kwin_rule_id", "")
-        if not rid:
-            return None
-        try:
-            def read(key):
-                return subprocess.check_output(
-                    ["kreadconfig6", "--file", "kwinrulesrc", "--group", rid, "--key", key],
-                    text=True, timeout=3).strip()
-            px, py = (int(v) for v in read("position").split(",", 1))
-            sw, sh = (int(v) for v in read("size").split(",", 1))
-            if sw < 160 or sh < 80:
-                return None
-            return {"x": px, "y": py, "w": sw, "h": sh}
-        except Exception:
-            return None
 
     def on_move(self, btn):
         """Free move: turn the drag bar on, put the keyboard wherever you like, turn it off
@@ -1641,7 +1610,6 @@ class OSK(Gtk.Window):
         self._pending_geometry = None
         self.cfg["position_mode"] = "bottom"
         self._persist("position_mode", "bottom")
-        self._last_rect = None
         self.ensure_placed(force=True)       # switches the rule off and reloads the script
         self._apply_handle()
         callback, self._move_finished_callback = self._move_finished_callback, None
@@ -1738,22 +1706,6 @@ class OSK(Gtk.Window):
             self._debug("movement finished")
             self._drag = None
 
-    def _clamp_rect(self, rect, out):
-        """Keep a rect inside `out`, whatever the resolution.
-
-        The shipped geometry is sized for a 1280x800 panel, so on anything shorter or
-        narrower the configured rect would hang off the edge — and a Wayland window that
-        is partly outside its output still takes taps while not being fully visible. Sizes
-        shrink to fit first, then the position is pulled back inside. No-op when it
-        already fits, so the usual case is untouched."""
-        if not out:
-            return rect
-        w = max(160, min(rect["w"], out["w"]))
-        h = max(80, min(rect["h"], out["h"]))
-        x = min(max(rect["x"], out["x"]), out["x"] + out["w"] - w)
-        y = min(max(rect["y"], out["y"]), out["y"] + out["h"] - h)
-        return {"x": x, "y": y, "w": w, "h": h}
-
     def _dock_rect(self, out, big):
         """The default spot: full width, flush with the bottom edge, height a fixed
         fraction of the panel. Steam's own on-screen keyboard sits like this, and because
@@ -1770,7 +1722,7 @@ class OSK(Gtk.Window):
 
     def _slot_rect(self, g, big=False):
         """Where the window goes: the bottom dock by default, or the position the user
-        dragged it to and locked (`position_mode: custom`). Always clamped to the panel."""
+        dragged it to and locked (`position_mode: custom`). Only docking is clamped."""
         outs = self._outputs()
         anchor = next((o for o in outs if o["internal"]), outs[0] if outs else None)
         if self.cfg.get("position_mode", "bottom") != "custom" or not g:
@@ -1779,27 +1731,6 @@ class OSK(Gtk.Window):
             return dict(g or DEFAULT_CONFIG["geometry"])
         # Custom: the user placed it. Hand it back untouched — no clamping, no anchoring.
         return {"x": g["x"], "y": g["y"], "w": g["w"], "h": g["h"]}
-
-    def _apply_kwin_geometry(self, g):
-        """Rewrite our KWin window-rule's forced position/size so it follows the toggle
-        and the internal-panel anchor; without this the Force rule would snap the window
-        back. Skips the write when the rect is unchanged (re-anchoring on every show would
-        otherwise reconfigure KWin needlessly and flicker)."""
-        rid = self.cfg.get("kwin_rule_id", "")
-        if not rid:
-            return
-        rect = (g["x"], g["y"], g["w"], g["h"])
-        if rect == getattr(self, "_last_rect", None):
-            return
-        self._last_rect = rect
-        try:
-            for key, val in (("position", f"{g['x']},{g['y']}"), ("size", f"{g['w']},{g['h']}")):
-                subprocess.run(["kwriteconfig6", "--file", "kwinrulesrc", "--group", rid,
-                                "--key", key, val], check=False, timeout=3)
-            subprocess.run([DBUS, "org.kde.KWin", "/KWin", "reconfigure"],
-                           check=False, timeout=3)
-        except Exception as ex:
-            print(f"handheld-kbd: kwin geometry update failed ({ex})", file=sys.stderr)
 
     def _refresh_mods(self):
         for b, k in self.modbtns:
@@ -2450,7 +2381,7 @@ def main():
         if backend["trigger"] == "inputplumber":
             setup_dbus_trigger(config, lambda: _toggle("InputPlumber"))
         elif backend["trigger"] == "ally-m1":
-            w._prepare_hhd_trigger(lambda: setup_hhd_trigger(config, lambda stamp: _toggle("M1", stamp)))
+            w._prepare_hhd_trigger(lambda: setup_hhd_trigger(backend, config, lambda stamp: _toggle("M1", stamp)))
 
     # Direct triggers start only after our DBus service owns its name. HHD also needs
     # the pre-map Steam focus rules enabled before it can send its first Toggle.
