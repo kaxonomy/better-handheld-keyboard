@@ -49,11 +49,13 @@ So I built the keyboard I wanted instead. Here's what it does differently:
 - **Colour themes.** Six ready-made palettes — Midnight, Light, High contrast, Nord,
   Solarized and Rose — from the tray **Settings ▸ Colour theme** or
   `handheld-kbd-ctl set color_theme <name>`. The whole keyboard recolours — keys, labels
-  and the predictive-text bar — the super-key logo tints to match, and the labels stay
+  and the predictive-text bar — monochrome launcher icons tint to match, and the labels stay
   legible whatever your desktop GTK theme is.
-- **Custom super-key icon.** Put a **Windows**, **Arch** or **Tux** logo on the meta key —
-  tray **Settings ▸ Super key icon** or `handheld-kbd-ctl super-icon <name>`. It tints to
-  the current theme, so it stays visible on the light themes too.
+- **Launcher key.** Tap to send the desktop's Super/Meta action (Application Launcher
+  on Plasma); hold and release to latch Super for a shortcut. The icon detects
+  **Bazzite**, **Arch**, or generic Linux automatically. Override it from tray
+  **Settings ▸ Launcher key icon** or `handheld-kbd-ctl super-icon <auto|bazzite|windows|arch|tux>`.
+  The Bazzite artwork comes from its [official press kit](https://github.com/ublue-os/bazzite/tree/main/press_kit).
 - **Split keyboard.** Turn on `split` (tray **Settings ▸ Split keyboard**, or
   `handheld-kbd-ctl set split true`) and each row's two halves slide out to the
   left and right edges with a clear gap down the middle — thumb-typing while you
@@ -140,9 +142,11 @@ never re-injects F17, and does not watch F17 on unrelated keyboards. Avoid bindi
 physical F17 to another desktop action on this device.
 
 Free movement uses touch/mouse gestures and KWin's logical `frameGeometry` through
-the keyboard's session DBus service. Docking is suspended while moving; Done saves
-the geometry reported by KWin. The helper restores that rectangle on later shows
-and restarts. Position rules no longer force a competing rectangle.
+the keyboard's session DBus service. Docking is suspended while moving; Done or
+hiding the keyboard saves the geometry reported by KWin before unmapping it. The
+drag handle overlays the keys so removing it cannot shift the layout. The helper
+restores that rectangle on later shows and restarts. Position rules no longer
+force a competing rectangle.
 The helper uses the [KWin 6 scripting API](https://develop.kde.org/docs/plasma/kwin/api/).
 
 To leave a gap above the usable bottom edge:
@@ -205,6 +209,7 @@ Acceptance check on the handheld (Steam Input can stay disabled):
    keyboard geometry with the saved geometry in `handheld-kbd-ctl status`.
 5. Hide/reopen, then run `handheld-kbd-ctl restart` and reopen. The custom rectangle
    must remain. Repeat on a second display with different scaling if available.
+   Also drag and close without pressing Done; reopening must retain that position.
 6. Run `handheld-kbd-ctl reset`, then set the bottom margin to 40 as above. Check
    all four sizes: `handheld-kbd-ctl windows` should report `bottomMargin: 40`.
 7. Suspend/resume, repeat M1 show/hide, and inspect diagnostics for the selected
@@ -230,6 +235,7 @@ python3 tools/test-install.py
 python3 tools/test-controls.py
 python3 tools/test-dbus.py
 python3 tools/test-input-method.py
+python3 tools/test-keys.py
 node tools/test-kwin.js
 ```
 

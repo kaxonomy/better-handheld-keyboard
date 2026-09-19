@@ -241,11 +241,11 @@ PY
         fi
         ;;
     super-icon)
-        # Set which OS logo the super/meta key wears, then restart so it re-renders.
+        # Set the launcher key icon, then restart so it re-renders.
         icon="${2:-}"
         case "$icon" in
-            windows|arch|tux) ;;
-            *) echo "usage: handheld-kbd-ctl super-icon {windows|arch|tux}" >&2; exit 2 ;;
+            auto|bazzite|windows|arch|tux) ;;
+            *) echo "usage: handheld-kbd-ctl super-icon {auto|bazzite|windows|arch|tux}" >&2; exit 2 ;;
         esac
         python3 - "$icon" <<'PY'
 import json, os, sys
@@ -315,7 +315,7 @@ PY
             || { echo "$key set; keyboard did not come back — see /tmp/handheld-kbd-out.log" >&2; exit 1; }
         ;;
     *)
-        echo "usage: handheld-kbd-ctl [status|diagnostics|windows|start|stop|restart|reset|super-icon <windows|arch|tux>|set <key> <value> [type]]" >&2
+        echo "usage: handheld-kbd-ctl [status|diagnostics|windows|start|stop|restart|reset|super-icon <auto|bazzite|windows|arch|tux>|set <key> <value> [type]]" >&2
         exit 2
         ;;
 esac

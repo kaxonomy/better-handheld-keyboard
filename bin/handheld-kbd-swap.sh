@@ -106,7 +106,7 @@ set_trigger_mode() {
     MIRROR=$CONFIG_MIRROR
     SEAMLESS_WANTED=0
     if [ "$INPUT_TRIGGER" = ally-m1 ]; then
-        # GetTrigger in the live KWin helper skips mirroring while direct M1 is ready.
+        # The live keyboard service skips Steam mirror actions while direct M1 is ready.
         # Keep its fallback available if input permissions or a reconnect delay capture.
         MIRROR=1
         : > "$FALLBACK"

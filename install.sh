@@ -115,6 +115,8 @@ for f in "$HERE"/config/layouts/*.json; do
 done
 
 # --- super-key logos (app assets, not user config — always refresh on upgrade) ---
+SUPER_ICON_UPGRADE=0
+[ -f "$SHARE/icons/super/bazzite.svg" ] || SUPER_ICON_UPGRADE=1
 mkdir -p "$SHARE/icons/super"
 for f in "$HERE"/assets/super/*.svg; do
   [ -e "$f" ] && install -m644 "$f" "$SHARE/icons/super/$(basename "$f")"
@@ -125,7 +127,7 @@ done
 # key while the user's layout kept no button for it — the feature simply never appeared.
 # Merge in any action key this release has that their layout lacks, and drop settings that
 # no longer do anything. Both are best-effort: a failure here must not fail the install.
-python3 - "$HERE/config" "$CFG" <<'PY' || warn "Layout/config upgrade skipped (see above)."
+python3 - "$HERE/config" "$CFG" "$SUPER_ICON_UPGRADE" <<'PY' || warn "Layout/config upgrade skipped (see above)."
 import json, os, shutil, sys
 
 SRC, DST = sys.argv[1], sys.argv[2]
@@ -206,6 +208,10 @@ try:
             mine.pop(k, None)
         save(cfg, mine)
         print(f"handheld-kbd: removed retired setting(s): {', '.join(gone)}")
+    # Replace the old shipped icon once; later choices survive reinstalls.
+    if sys.argv[3] == "1" and mine.get("super_icon", "windows") == "windows":
+        mine["super_icon"] = "auto"
+        save(cfg, mine)
 except Exception as ex:
     print(f"handheld-kbd: config tidy skipped ({ex})", file=sys.stderr)
 PY

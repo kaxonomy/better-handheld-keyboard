@@ -99,6 +99,7 @@ else:
     config_path = home / ".config/handheld-kbd/config.json"
     config = json.loads(config_path.read_text())
     assert config["dock_bottom_margin"] == 0
+    assert config["super_icon"] == "auto"
     assert (home / ".local/bin/handheld_kbd_backend.py").read_bytes() == (ROOT / "bin/handheld_kbd_backend.py").read_bytes()
     assert (home / ".local/bin/handheld-kbd-dbus").read_bytes() == (ROOT / "bin/handheld-kbd-dbus").read_bytes()
     provider = str(home / ".local/share/applications/handheld-kbd-input-method.desktop")
@@ -114,9 +115,17 @@ else:
     for rule in STEAM_RULES:
         assert rules[rule]["acceptfocusrule"] == rules[rule]["opacityactiverule"] == "0"
 
+    # An old shipped Windows icon upgrades once; a later explicit choice is kept.
+    (home / ".local/share/handheld-kbd/icons/super/bazzite.svg").unlink()
+    config["super_icon"] = "windows"
+    config_path.write_text(json.dumps(config))
+    run("install.sh")
+    config["super_icon"] = "auto"
+    assert json.loads(config_path.read_text()) == config
+
     # Customized upgrades keep every setting and a running supervisor's rule state.
     config.update(mirror=False, dock_bottom_margin=40, position_mode="custom",
-                  geometry={"x": -100, "y": 75, "w": 850, "h": 320}, custom_setting="keep")
+                  geometry={"x": -100, "y": 75, "w": 850, "h": 320}, custom_setting="keep", super_icon="windows")
     config_path.write_text(json.dumps(config))
     for rule in STEAM_RULES:
         for key in ("acceptfocusrule", "opacityactiverule", "opacityinactiverule"):

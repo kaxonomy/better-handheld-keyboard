@@ -20,7 +20,7 @@ GLib.set_prgname("handheld-kbd")   # app_id so the KWin window-rule can match us
 
 CFG_DIR = os.path.expanduser("~/.config/handheld-kbd")
 # Installed data (icons, learned dict). The installer drops the super-key logos in
-# icons/super/{windows,arch,tux}.svg here.
+# icons/super/{bazzite,windows,arch,tux}.svg here.
 SHARE_DIR = os.path.expanduser("~/.local/share/handheld-kbd")
 SUPER_ICON_DIR = os.path.join(SHARE_DIR, "icons", "super")
 
@@ -31,10 +31,10 @@ GS_DISPLAY = os.environ.get("HANDHELD_KBD_GS_DISPLAY", os.environ.get("DISPLAY",
 
 DEFAULT_CONFIG = {
     "layout": "full", "locale": "auto", "opacity": 0.72,
-    # Which OS logo the super/meta key wears: "windows" | "arch" | "tux".
-    # Rendered from icons/super/<name>.svg; falls back to the ⊞ glyph if missing.
-    # Change it live from the tray ("Super key icon") or: handheld-kbd-ctl super-icon <name>.
-    "super_icon": "windows",
+    # Launcher key icon: "auto" | "bazzite" | "windows" | "arch" | "tux".
+    # Tap for the desktop's Super/Meta action; hold for a Super-key shortcut.
+    # Change it from the tray or: handheld-kbd-ctl super-icon <name>.
+    "super_icon": "auto",
     # Transparency cycle: an opacity key (kind "opacity") steps through these values
     # (opaque → most transparent, then wraps). Persisted live, applied via the KWin script.
     "opacity_steps": [1.0, 0.85, 0.7, 0.55, 0.4, 0.25],
@@ -247,13 +247,31 @@ def load_config():
         return _apply_theme_preset(dict(DEFAULT_CONFIG), {})
 
 
+def super_icon_name(config):
+    name = str(config.get("super_icon", "auto") or "").strip().lower()
+    if name != "auto":
+        return name
+    import platform
+    try:
+        release = platform.freedesktop_os_release()
+    except (OSError, AttributeError):
+        release = {}
+    distro = release.get("ID", "").lower()
+    variant = release.get("VARIANT_ID", "").lower()
+    if distro == "bazzite" or variant == "bazzite" or variant.startswith("bazzite-"):
+        return "bazzite"
+    if distro == "arch" or "arch" in release.get("ID_LIKE", "").split():
+        return "arch"
+    return "tux"
+
+
 def apply_super_icon(config, button, kh):
-    """Put the chosen OS logo (config['super_icon']) on the super/meta key.
+    """Put the chosen icon (config['super_icon']) on the launcher key.
 
     Renders icons/super/<name>.svg scaled to the key. Anything unset/unknown/missing
-    is a no-op, so the key keeps its text face (⊞) — it must never come up blank.
+    is a no-op, so the key keeps its text face (Apps) — it must never come up blank.
     """
-    name = str(config.get("super_icon", "windows") or "").strip().lower()
+    name = super_icon_name(config)
     if name in ("", "none", "glyph", "default"):
         return
     path = os.path.join(SUPER_ICON_DIR, name + ".svg")
@@ -261,12 +279,13 @@ def apply_super_icon(config, button, kh):
         return
     try:
         size = max(20, int(kh * 0.55))
-        # The logos ship as white monochrome (fill="#f5f5f5"); tint them to the theme's
+        # Monochrome logos ship as white (fill="#f5f5f5"); tint them to the theme's
         # text colour so they stay visible on light themes (white-on-white otherwise).
         fg = (config.get("theme") or {}).get("key_fg", "#f5f5f5")
         svg = open(path, "r", encoding="utf-8").read()
-        for c in ("#f5f5f5", "#F5F5F5", "#ffffff", "#FFFFFF", "#fff", "#FFF"):
-            svg = svg.replace(c, fg)
+        if name != "bazzite":       # keep the official Bazzite artwork's colours
+            for c in ("#f5f5f5", "#F5F5F5", "#ffffff", "#FFFFFF", "#fff", "#FFF"):
+                svg = svg.replace(c, fg)
         loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
         loader.set_size(size, size)
         loader.write(svg.encode("utf-8"))
@@ -275,7 +294,7 @@ def apply_super_icon(config, button, kh):
         img = Gtk.Image.new_from_pixbuf(pix)
         button.set_image(img)
         button.set_always_show_image(True)
-        button.set_label("")        # image only; drop the ⊞ text
+        button.set_label("")        # image only; drop the fallback text
     except Exception as ex:
         print(f"handheld-kbd: super icon '{name}' failed ({ex})", file=sys.stderr)
 
@@ -397,8 +416,8 @@ window {{ background-color: {t['window_bg']}; }}
 button {{ background: {t['key_bg']}; color: {t['key_fg']}; border: 1px solid {t['key_border']};
          border-radius: 5px; font-size: 18px; margin: 2px; padding: 6px; }}
 button:active {{ background: {t['key_active']}; }}
-button.mod-on {{ background: {t['mod_on_bg']}; color: {t['mod_on_fg']}; font-weight: bold;
-                border: 3px solid {t['mod_on_border']}; }}
+button.mod-on {{ background: {t['mod_on_bg']}; color: {t['mod_on_fg']};
+                border-color: {t['mod_on_border']}; box-shadow: inset 0 0 0 2px {t['mod_on_border']}; }}
 button.shift-live {{ background: {t.get('shift_live_bg', '#26426e')}; color: {t.get('key_fg')}; }}
 button.special {{ background: {t['special_bg']}; color: {t['special_fg']}; }}
 button.hide {{ background: #5a1f1f; color: #ffd9d9; }}
@@ -455,6 +474,7 @@ class OSK(Gtk.Window):
         self._pending_geometry = None
         self._drag = None
         self._finishing_move = False
+        self._move_finished_callback = None
         self.hide_cb = None            # set by main(); keeps the hide path single-sourced
         # size_level (0 Normal / 1 Big / 2 Bigger) is the source of truth; start_big is a
         # derived boolean mirror the KWin-script and swap daemon still read. Seed from
@@ -570,6 +590,13 @@ class OSK(Gtk.Window):
             elif kind == 'hide':
                 b.get_style_context().add_class('hide')
                 b.connect("clicked", lambda *_: self.dismiss())
+            elif name == 'KEY_LEFTMETA':
+                b.get_style_context().add_class('special')
+                b.connect("pressed", lambda btn: setattr(btn, "_launcher_pressed_at", time.monotonic()))
+                b.connect("clicked", self.on_launcher, kc); self.modbtns.append((b, kc))
+                b.set_tooltip_text("Open application launcher; hold for a Super-key shortcut")
+                b.get_accessible().set_name("Application launcher")
+                b.set_label("Apps")
             elif kind == 'mod':
                 b.get_style_context().add_class('special')
                 b.connect("clicked", self.on_mod, kc); self.modbtns.append((b, kc))
@@ -647,13 +674,18 @@ class OSK(Gtk.Window):
             outer.pack_end(keys_root, False, False, 0)
             self.add(outer)
         else:
-            # handle bar (hidden while locked) → suggestions → keys
+            # The handle overlays the keys while moving. Inserting/removing a row
+            # here shifts the keys upward on Done even if the frame never moves.
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-            box.pack_start(self.handle, False, False, 0)
             if self.sugbar is not None:
                 box.pack_start(self.sugbar, False, False, 0)
             box.pack_start(keys_root, True, True, 0)
-            self.add(box)
+            overlay = Gtk.Overlay()
+            overlay.add(box)
+            self.handle.set_halign(Gtk.Align.FILL)
+            self.handle.set_valign(Gtk.Align.START)
+            overlay.add_overlay(self.handle)
+            self.add(overlay)
         self.set_wmclass("handheld-kbd", "handheld-kbd")
         self.set_title("handheld-kbd")
         self.set_decorated(False)
@@ -1244,8 +1276,7 @@ class OSK(Gtk.Window):
             # fraction of the display on a 800px panel as on a 1200px one.
             rect = self._slot_rect(g, big)
             if self.unlocked and self.get_realized():
-                # Reserve the handle inside the existing compositor allocation; adding
-                # its height to the key minimum would otherwise resize the whole window.
+                # Keep the current allocation while the compositor moves/resizes us.
                 rect = dict(rect, w=self.get_allocated_width(), h=self.get_allocated_height())
             # The suggestion row eats into that height. apply_size() also runs before the
             # window is realised, where the row measures as ~0 — so trust the configured
@@ -1254,8 +1285,7 @@ class OSK(Gtk.Window):
             if self.sugbar is not None:
                 bar = max(int(self.cfg.get("suggest_height", 44)) + 8,
                           self.sugbar.get_preferred_height()[0])
-            handle = (int(self.cfg.get("handle_height", 30)) + 4) if self.unlocked else 0
-            fit = (rect["h"] - bar - handle - 8) // self.nrows   # 8 = grid margins
+            fit = (rect["h"] - bar - 8) // self.nrows   # 8 = grid margins
             kh = max(24, min(kh, fit))
         # Split keys grow in BOTH dimensions per size level: row_homogeneous fills their
         # height, and we widen them by the same ratio the height grew so they stay in
@@ -1507,36 +1537,45 @@ class OSK(Gtk.Window):
             return
         if self._finishing_move:
             return
-        self.unlocked = not self.unlocked
-        if self.unlocked:
+        if not self.unlocked:
+            self.unlocked = True
             self._debug("KWin movement requested")
             self._pending_geometry = None
             self.reported_rect = None
             self._set_rule_mode(1)              # DontAffect: nothing pins it while dragging
             self._reload_kwin_script(report=True)   # script stops placing, starts reporting
-            self.apply_size()                 # make room for the handle without resizing
+            self.apply_size()                 # keep the existing compositor allocation
         else:
-            # Leaving free-move must never move the window. Ask KWin where it is, give the
-            # reply a moment to land (the main loop has to stay free to receive it), then
-            # pin it exactly there.
-            self._finishing_move = True
-            self._final_geometry_received = False
-            self._drag = None
-            # Let the helper consume the last queued motion before taking the snapshot.
-            GLib.timeout_add(60, self._request_final_geometry)
-            self._finish_tries = 0
-            # Wait for the answer instead of guessing how long it takes. A fixed delay was
-            # a race: when the reply landed late we had already given up, and giving up
-            # means the script re-docks — which is exactly the "✓ resets it" report.
-            GLib.timeout_add(100, self._finish_move)
+            self.finish_movement()
         self._apply_handle()
+
+    def finish_movement(self, callback=None):
+        """Finish before Done or hide; the Wayland surface must survive the snapshot."""
+        if self._finishing_move:
+            if callback is not None:
+                self._move_finished_callback = callback
+            return
+        if not self.unlocked:
+            if callback is not None:
+                callback()
+            return
+        self.unlocked = False
+        self._finishing_move = True
+        self._move_finished_callback = callback
+        self._final_geometry_received = False
+        self._drag = None
+        self._finish_tries = 0
+        self._apply_handle()
+        # Drain the last motion before asking for the compositor's actual frame.
+        GLib.timeout_add(60, self._request_final_geometry)
+        GLib.timeout_add(100, self._finish_move)
 
     def _request_final_geometry(self):
         if not self._finishing_move:
             return False
         if self._pending_geometry:
             return True
-        self.reported_rect = None
+        self._final_geometry_received = False
         self.request_geometry()
         return False
 
@@ -1553,23 +1592,21 @@ class OSK(Gtk.Window):
                 if self._finish_tries in (3, 7, 12, 17):
                     self._request_final_geometry()
                 return True                       # keep waiting
-            # No answer: freeze by doing nothing. Forcing the rect from kwinrulesrc here is
-            # what used to yank the keyboard back to the dock, because that file still holds
-            # the old forced position until the window closes.
-            # Never leave it in docking mode after a move: docking re-asserts itself on the
-            # next geometry change, which is the keyboard snapping back a moment later —
-            # intermittent, because it only happens when the reply was too slow. "free"
-            # means nothing places the window at all, so where the user left it is where it
-            # stays. ⤓ is how you get back to the dock.
-            print("handheld-kbd: no geometry from KWin; freezing placement so it cannot "
-                  "snap back", file=sys.stderr)
-            self.cfg["position_mode"] = "free"
-            self._persist("position_mode", "free")
-            self._reload_kwin_script(report=False)
-            self._placed_key = None
-            self._pending_geometry = None
-            self._finishing_move = False
-            return False
+            if self.reported_rect:
+                # Keep the last confirmed frame if the one-shot reporter fails. Never
+                # lose a successful move merely because the final DBus reply was late.
+                print("handheld-kbd: final geometry unavailable; saving last KWin frame",
+                      file=sys.stderr)
+                g = self.reported_rect
+            else:
+                # A remembered rule may contain the old dock. Without a compositor
+                # report leave placement alone; Reset can restore docking.
+                print("handheld-kbd: no geometry from KWin; freezing placement so it cannot "
+                      "snap back", file=sys.stderr)
+                self.cfg["position_mode"] = "free"
+                self._persist("position_mode", "free")
+                self._complete_movement()
+                return False
         # Stored exactly as KWin reports it, in absolute compositor coordinates, with no
         # clamping: a keyboard you moved by hand should stay where you put it, including
         # half off the edge, like any other window. ⤓ is the way back to the dock.
@@ -1580,10 +1617,17 @@ class OSK(Gtk.Window):
         self._persist("geometry", self.cfg["geometry"])
         self._persist("position_mode", "custom")
         self._debug("geometry persisted: " + json.dumps(g))
+        self._complete_movement()
+        return False
+
+    def _complete_movement(self):
         self._reload_kwin_script(report=False)
         self._placed_key = None
+        self._pending_geometry = None
         self._finishing_move = False
-        return False
+        callback, self._move_finished_callback = self._move_finished_callback, None
+        if callback is not None:
+            callback()
 
     def on_reset(self, btn):
         """Reset: back to the default bottom dock, forgetting wherever it was moved to."""
@@ -1598,6 +1642,9 @@ class OSK(Gtk.Window):
         self._last_rect = None
         self.ensure_placed(force=True)       # switches the rule off and reloads the script
         self._apply_handle()
+        callback, self._move_finished_callback = self._move_finished_callback, None
+        if callback is not None:
+            callback()
 
     def _apply_handle(self):
         """Show the drag bar and resize grips only while unlocked, and relabel the key."""
@@ -1766,6 +1813,16 @@ class OSK(Gtk.Window):
         if kc in (e.KEY_RIGHTALT, e.KEY_LEFTSHIFT, e.KEY_RIGHTSHIFT):
             self._relabel()
 
+    def on_launcher(self, btn, kc):
+        pressed = getattr(btn, "_launcher_pressed_at", None)
+        btn._launcher_pressed_at = None
+        # A tap sends both edges so the desktop can perform its native Meta action.
+        # Holding retains the old sticky modifier for shortcuts such as Super+E.
+        if kc in self.mods or (pressed is not None and time.monotonic() - pressed >= 0.5):
+            self.on_mod(btn, kc)
+        else:
+            self.on_key(btn, kc)
+
     def _stray_tap(self):
         """True just after a swipe ends: GTK may still deliver a click for the key the
         finger lifted over, which is not something the user meant to press."""
@@ -1865,6 +1922,9 @@ SERVICE_XML = """
     <method name='Show'/>
     <method name='Hide'/>
     <method name='Toggle'/>
+    <method name='SteamOsk'>
+      <arg type='s' name='action' direction='in'/>
+    </method>
     <method name='InputMethod'>
       <arg type='b' name='visible' direction='in'/>
     </method>
@@ -1890,7 +1950,7 @@ _service_keepalive = []
 
 
 def setup_service(show, hide, toggle, set_geometry=None, free_move=None, reset=None,
-                  next_geometry=None, ready=None, input_method=None):
+                  next_geometry=None, ready=None, input_method=None, steam_osk=None):
     """Expose Show/Hide/Toggle on the session bus.
 
     This is what replaced polling. The KWin script calls these the moment Steam's
@@ -1907,6 +1967,8 @@ def setup_service(show, hide, toggle, set_geometry=None, free_move=None, reset=N
         try:
             if method == "InputMethod" and input_method is not None:
                 input_method(params.unpack()[0])
+            elif method == "SteamOsk" and steam_osk is not None:
+                steam_osk(params.unpack()[0])
             elif method == "SetGeometry" and set_geometry is not None:
                 set_geometry(params.unpack()[0])
             elif method == "NextGeometry":
@@ -2256,7 +2318,7 @@ def main():
     open("/tmp/handheld-kbd.pid", "w").write(str(os.getpid()))
     VIS = "/tmp/handheld-kbd.vis"
 
-    state = {"shown": False, "automatic": False, "input_method": False}
+    state = {"shown": False, "automatic": False, "input_method": False, "hiding": None}
 
     def _setvis(v):
         # The file is for the daemon's benefit; the in-memory flag is what we act on, so a
@@ -2266,6 +2328,8 @@ def main():
         except Exception: pass
 
     def _show(*_):
+        w._debug("show requested; shown=%s automatic=%s" % (state["shown"], state["automatic"]))
+        state["hiding"] = None
         state["automatic"] = False
         if state["shown"]:
             return True                   # already up: nothing to do, no flicker
@@ -2278,38 +2342,62 @@ def main():
         _mark_proven()
         _setvis("1"); return True
 
-    def _hide(*_):
+    def _hide(*_, automatic=False):
         if not state["shown"]:
             return True
-        if GAMEMODE: w.gm_hide()
-        w.hide(); _setvis("0")
-        state["automatic"] = False
-        if state["input_method"]:
-            # Dismiss this text-input context without disabling Plasma's provider.
-            # The next tap on the same field can then summon the keyboard again.
-            from gi.repository import Gio
-            def dismissed(conn, result):
+        w._debug("hide requested; automatic=%s input_method=%s" % (state["automatic"], state["input_method"]))
+        if not automatic:
+            state["automatic"] = False
+        pending = state["hiding"] = object()
+        def do_hide():
+            if state["hiding"] is not pending:
+                return
+            state["hiding"] = None
+            if GAMEMODE: w.gm_hide()
+            w.hide(); _setvis("0")
+            state["automatic"] = False
+            if state["input_method"]:
+                # Dismiss this text-input context without disabling Plasma's provider.
+                # The next tap on the same field can then summon the keyboard again.
+                from gi.repository import Gio
+                def dismissed(conn, result):
+                    try:
+                        conn.call_finish(result)
+                    except GLib.Error as ex:
+                        w._debug("input-method dismissal failed: " + str(ex))
                 try:
-                    conn.call_finish(result)
+                    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+                    bus.call("org.handheld.Keyboard.InputMethod", "/org/handheld/Keyboard/InputMethod",
+                             "org.handheld.Keyboard.InputMethod", "Dismiss", None, None,
+                             Gio.DBusCallFlags.NO_AUTO_START, 2000, None, dismissed)
                 except GLib.Error as ex:
                     w._debug("input-method dismissal failed: " + str(ex))
-            try:
-                bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-                bus.call("org.handheld.Keyboard.InputMethod", "/org/handheld/Keyboard/InputMethod",
-                         "org.handheld.Keyboard.InputMethod", "Dismiss", None, None,
-                         Gio.DBusCallFlags.NO_AUTO_START, 2000, None, dismissed)
-            except GLib.Error as ex:
-                w._debug("input-method dismissal failed: " + str(ex))
+        w.finish_movement(do_hide)
         return True
     w.hide_cb = _hide                 # the hide key routes through here, so state stays in sync
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, _show, None)
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, _hide, None)
 
-    def _toggle():
-        w._debug("toggle requested")
-        (_hide if state["shown"] else _show)()
+    def _toggle(source="manual"):
+        w._debug("toggle requested (%s); shown=%s automatic=%s" % (source, state["shown"], state["automatic"]))
+        (_hide if state["shown"] and state["hiding"] is None else _show)()
+
+    def _steam_osk(action):
+        from handheld_kbd_backend import hhd_trigger_ready
+        # Check and act in the same event-loop callback. A separate GetTrigger
+        # reply followed by Toggle could race a reconnect or the physical press.
+        if hhd_trigger_ready():
+            w._debug("Steam OSK trigger ignored; direct M1 listener ready")
+            return
+        if action == "Toggle":
+            _toggle("Steam mirror")
+        elif action == "Show":
+            _show()
+        elif action == "Hide":
+            _hide()
 
     def _input_method(visible):
+        w._debug("Plasma input-method visible=%s; shown=%s automatic=%s" % (visible, state["shown"], state["automatic"]))
         if visible == state["input_method"]:
             return
         state["input_method"] = visible
@@ -2317,10 +2405,12 @@ def main():
             if not state["shown"]:
                 _show()
                 state["automatic"] = True
+            elif state["automatic"]:
+                state["hiding"] = None  # a new text field cancels pending automatic hide
         else:
             def hide_automatic():
                 if not state["input_method"] and state["automatic"]:
-                    _hide()
+                    _hide(automatic=True)
                 return False
             # Moving between text fields can deactivate/reactivate the protocol
             # in one gesture. Never hide a keyboard opened manually by M1.
@@ -2339,13 +2429,13 @@ def main():
         if backend["trigger"] == "inputplumber":
             setup_dbus_trigger(config, _toggle)
         elif backend["trigger"] == "ally-m1":
-            w._prepare_hhd_trigger(lambda: setup_hhd_trigger(config))
+            w._prepare_hhd_trigger(lambda: setup_hhd_trigger(config, lambda: _toggle("M1")))
 
     # Direct triggers start only after our DBus service owns its name. HHD also needs
     # the pre-map Steam focus rules enabled before it can send its first Toggle.
     setup_service(_show, _hide, _toggle, w.set_reported_geometry,
                   lambda: w.on_move(None), lambda: w.on_reset(None), w.next_geometry,
-                  _setup_input_backend, _input_method)
+                  _setup_input_backend, _input_method, _steam_osk)
     if GAMEMODE:
         setup_dbus_trigger(config, _toggle)
     setup_hotkey(config, _toggle)         # optional evdev hotkey (attached kbd / Steam Input chord)

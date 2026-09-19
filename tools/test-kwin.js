@@ -74,6 +74,15 @@ try {
     moved.frameGeometry.x = -900;
     custom.context.dockKbd(moved);
     assert.equal(moved.frameGeometry.x, -900, 'custom geometry must not be repeatedly enforced');
+    const saved = {position_mode: 'custom', dock_bottom_margin: 40,
+        geometry: {x: -900, y: 120, w: 700, h: 350}};
+    const completed = run(saved, [], [moved]);
+    assert.equal(moved.frameGeometry.x, -900, 'finishing a move must leave the current frame alone');
+    completed.context.workspace.windowRemoved.emit(moved);
+    const reopened = window({resourceClass: 'handheld-kbd'});
+    completed.add(reopened);
+    assert.deepEqual(reopened.frameGeometry, {x: -900, y: 120, width: 700, height: 350},
+        'a new Wayland surface must restore the saved frame, ignoring the dock margin');
 
     const diagnosticKbd = window({resourceClass: 'handheld-kbd'});
     const diagnosticSteam = window({resourceClass: 'steam', caption: 'SP Keyboard'});
@@ -91,21 +100,23 @@ try {
     const genericSteam = window({resourceClass: 'steam', caption: 'SP Keyboard'});
     generic.add(genericSteam);
     genericSteam.captionChanged.emit();
-    assert.equal(generic.calls.filter(call => call.method === 'Toggle').length, 1);
+    assert.equal(generic.calls.filter(call => call.method === 'SteamOsk' && call.args[0] === 'Toggle').length, 1);
     assert(genericSteam.closed && genericSteam.opacity === 0);
     const hhd = run({mirror: true});
     hhd.context.trigger = 'ally-m1';
     const hhdSteam = window({resourceClass: 'steam', caption: 'SP Keyboard'});
     hhd.add(hhdSteam);
     assert(hhdSteam.closed);
-    assert(!hhd.calls.some(call => call.method === 'Toggle'));
+    assert(hhd.calls.some(call => call.method === 'SteamOsk'));
+    assert(!hhd.calls.some(call => call.method === 'Toggle' || call.method === 'GetTrigger'),
+           'service must choose the mirror fallback atomically');
     const late = run({mirror: true});
     const lateSteam = window({resourceClass: 'steam', caption: ''});
     late.add(lateSteam);
     lateSteam.caption = 'SP Keyboard';
     lateSteam.captionChanged.emit();
     assert(lateSteam.closed);
-    assert.equal(late.calls.filter(call => call.method === 'Toggle').length, 1);
+    assert.equal(late.calls.filter(call => call.method === 'SteamOsk' && call.args[0] === 'Toggle').length, 1);
 
     const kbd = window({resourceClass: 'handheld-kbd'});
     const movement = run({}, ['--dock', '0', '--report', '1'], [kbd]);

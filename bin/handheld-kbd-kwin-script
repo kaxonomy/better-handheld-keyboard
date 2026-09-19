@@ -268,17 +268,6 @@ function dockKbd(w){
     placing = false;
 }
 
-// Drive our keyboard straight from the compositor's own window events — no polling, and
-// the call goes out in the same event as the window mapping, so the keyboard appears
-// immediately rather than up to a poll interval later.
-function callKbd(method){
-    try {
-        debug(method + " requested");
-        callDBus("org.handheld.Keyboard", "/org/handheld/Keyboard",
-                 "org.handheld.Keyboard", method);
-    } catch(e){}
-}
-
 function watch(w){
     try { w.fullScreenChanged.connect(applyStack); w.minimizedChanged.connect(applyStack); } catch(e){}
     if (REPORT && isKbd(w)) { watchGeometry(w); reportGeometry(w); }
@@ -341,9 +330,7 @@ function onSteamOsk(w){
     // HHD sees the same physical event and opens Steam's OSK independently of
     // Steam Input. Its direct M1 listener already toggled ours: never toggle twice.
     callDBus("org.handheld.Keyboard", "/org/handheld/Keyboard",
-             "org.handheld.Keyboard", "GetTrigger", function(trigger){
-        if (trigger !== "ally-m1") callKbd(CLOSE_STEAM ? "Toggle" : "Show");
-    });
+             "org.handheld.Keyboard", "SteamOsk", CLOSE_STEAM ? "Toggle" : "Show");
 }
 
 function closeSteamOsk(w){
@@ -438,9 +425,7 @@ workspace.windowRemoved.connect(function(w){
     // closeWindow() would hide the keyboard we just summoned.
     if (MIRROR && !CLOSE_STEAM && isSteamOsk(w)) {
         callDBus("org.handheld.Keyboard", "/org/handheld/Keyboard",
-                 "org.handheld.Keyboard", "GetTrigger", function(trigger){
-            if (trigger !== "ally-m1") callKbd("Hide");
-        });
+                 "org.handheld.Keyboard", "SteamOsk", "Hide");
     }
 });
 applyStack();

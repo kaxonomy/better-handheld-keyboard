@@ -190,8 +190,9 @@ def read_runtime_status():
 
 
 class AllyM1Trigger:
-    def __init__(self, info, config, glib, gio, input_device):
-        self.info, self.glib, self.gio, self.input_device = info, glib, gio, input_device
+    def __init__(self, info, config, glib, input_device, toggle):
+        self.info, self.glib, self.input_device = info, glib, input_device
+        self.toggle = toggle
         self.debug = bool(config.get("debug", False)) or os.environ.get("HANDHELD_KBD_DEBUG") == "1"
         self.device = None
         self.watch = None
@@ -199,7 +200,6 @@ class AllyM1Trigger:
         self.press = M1Press()
         self.dropped = False
         self.error = ""
-        self.bus = gio.bus_get_sync(gio.BusType.SESSION, None)
         self._status()
         self.rescan()
         self.timer = glib.timeout_add_seconds(2, self.rescan)
@@ -259,7 +259,9 @@ class AllyM1Trigger:
                 self.device = device
                 self.press = M1Press()
                 self.press.down = KEY_F17 in device.active_keys()
-                self.watch = self.glib.io_add_watch(device.fd,
+                # Resolve the physical press before queued native-panel/Steam
+                # notifications from the same press can change visibility.
+                self.watch = self.glib.io_add_watch(device.fd, self.glib.PRIORITY_HIGH,
                     self.glib.IO_IN | self.glib.IO_HUP | self.glib.IO_ERR, self.on_input)
                 self.error = ""
                 self._status()
@@ -293,9 +295,13 @@ class AllyM1Trigger:
                         self.dropped = False
                 elif self.press.feed(event.type, event.code, event.value, time.monotonic()):
                     self._log("M1 event received; toggle requested", debug=True)
-                    self.bus.call("org.handheld.Keyboard", "/org/handheld/Keyboard",
-                                  "org.handheld.Keyboard", "Toggle", None, None,
-                                  self.gio.DBusCallFlags.NONE, 2000, None, self.on_toggle)
+                    # This listener runs in the keyboard's own GLib loop. Calling
+                    # its Toggle handler now avoids a self-DBus round trip during
+                    # which Plasma could show the keyboard automatically first.
+                    try:
+                        self.toggle()
+                    except Exception as ex:
+                        self._log(f"M1 toggle failed ({ex})")
         except BlockingIOError:
             pass
         except OSError as ex:
@@ -304,26 +310,20 @@ class AllyM1Trigger:
             return False
         return True
 
-    def on_toggle(self, connection, result):
-        try:
-            connection.call_finish(result)
-        except Exception as ex:
-            self._log(f"M1 toggle failed ({ex})")
-
 
 def hhd_trigger_ready():
     return any(trigger.device is not None for trigger in _keepalive)
 
 
-def setup_hhd_trigger(config):
+def setup_hhd_trigger(config, toggle):
     info = detect_backend(config)
     if info["trigger"] != "ally-m1":
         return None
     print(f"handheld-kbd: input backend: {info['backend']}; device: {info['device']}; trigger: ally-m1", file=sys.stderr)
     try:
-        from gi.repository import GLib, Gio
+        from gi.repository import GLib
         from evdev import InputDevice
-        trigger = AllyM1Trigger(info, config, GLib, Gio, InputDevice)
+        trigger = AllyM1Trigger(info, config, GLib, InputDevice, toggle)
         _keepalive.append(trigger)
         return trigger
     except Exception as ex:
@@ -349,6 +349,14 @@ def diagnostics():
                  "m1_devices": candidates, "selected_m1_device": selected,
                  "selected_m1_name": next((item["name"] for item in candidates if item["path"] == selected), ""),
                  "selected_m1_event": "KEY_F17 (187)" if info["ally_m1"] else "", "error": runtime.get("error", "")})
+    # A TTY or SSH caller may not share the graphical process's runtime directory.
+    # Prefer the running service over that caller's cached status file.
+    live = _command(["busctl", "--user", "call", "org.handheld.Keyboard", "/org/handheld/Keyboard",
+                     "org.handheld.Keyboard", "GetTrigger"])
+    if live.startswith('s "'):
+        info["ready"] = live == 's "ally-m1"'
+        if info["ready"]:
+            info["error"] = ""
     return info
 
 

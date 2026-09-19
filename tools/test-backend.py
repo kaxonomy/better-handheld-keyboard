@@ -85,6 +85,19 @@ class BackendTests(unittest.TestCase):
     def test_stale_api_socket_is_not_active(self):
         self.assertFalse(backend.hhd_api_active("/nonexistent/handheld-kbd-test.socket"))
 
+    def test_diagnostics_prefers_live_trigger_over_tty_runtime_file(self):
+        info = self.detect(hhd_api=True)
+        with patch.object(backend, "detect_backend", return_value=info), \
+             patch.object(backend, "read_runtime_status", return_value={}), \
+             patch.object(backend, "ally_devices", return_value=[]), \
+             patch.object(backend, "_command", return_value='s "ally-m1"'):
+            self.assertTrue(backend.diagnostics()["ready"])
+        with patch.object(backend, "detect_backend", return_value=info), \
+             patch.object(backend, "read_runtime_status", return_value={"ready": True}), \
+             patch.object(backend, "ally_devices", return_value=[]), \
+             patch.object(backend, "_command", return_value='s ""'):
+            self.assertFalse(backend.diagnostics()["ready"])
+
     def test_press_debounce_and_filter(self):
         press = backend.M1Press()
         self.assertFalse(press.feed(backend.EV_KEY, 188, 1, 1))  # M2 untouched
@@ -143,7 +156,7 @@ class DeviceTests(unittest.TestCase):
     def trigger(self):
         candidate_fn = backend.ally_devices
         patch.object(backend, "ally_devices", side_effect=lambda dmi: candidate_fn(dmi, self.sysfs, self.devroot)).start()
-        self.calls, self.opened, self.removed = [], [], []
+        self.calls, self.opened, self.removed, self.watches = [], [], [], []
         self.active = []
         owner = self
         class Device:
@@ -160,14 +173,11 @@ class DeviceTests(unittest.TestCase):
                 return iter(events)
             def close(self): self.closed = True
         self.device_class = Device
-        self.glib = SimpleNamespace(IO_IN=1, IO_HUP=2, IO_ERR=4,
-            io_add_watch=lambda *args: 1, timeout_add_seconds=lambda *args: 2,
+        self.glib = SimpleNamespace(IO_IN=1, IO_HUP=2, IO_ERR=4, PRIORITY_HIGH=-100,
+            io_add_watch=lambda *args: self.watches.append(args) or 1, timeout_add_seconds=lambda *args: 2,
             source_remove=self.removed.append)
-        bus = SimpleNamespace(call=lambda *args: self.calls.append(args))
-        self.gio = SimpleNamespace(BusType=SimpleNamespace(SESSION=1),
-            DBusCallFlags=SimpleNamespace(NONE=0), bus_get_sync=lambda *args: bus)
         with contextlib.redirect_stderr(io.StringIO()):
-            return backend.AllyM1Trigger({"dmi": DMI}, {}, self.glib, self.gio, Device)
+            return backend.AllyM1Trigger({"dmi": DMI}, {}, self.glib, Device, lambda: self.calls.append("Toggle"))
 
     def test_disconnect_reconnect_and_reused_event_number(self):
         first = self.device("event5")
@@ -205,7 +215,8 @@ class DeviceTests(unittest.TestCase):
         trigger.device.events = [event(1, 188, 1), event(1, 187, 1), event(1, 187, 2), event(1, 187, 1)]
         trigger.on_input(42, 1)
         self.assertEqual(len(self.calls), 1)
-        self.assertEqual(self.calls[0][3], "Toggle")
+        self.assertEqual(self.calls[0], "Toggle")
+        self.assertEqual(self.watches[0][1], self.glib.PRIORITY_HIGH)
         # Fake evdev has no write, grab, or uinput methods: passively reading is enough.
 
     def test_device_identity_rechecked_after_open(self):
@@ -217,6 +228,33 @@ class DeviceTests(unittest.TestCase):
             trigger.rescan()
         self.assertIsNone(trigger.device)
         self.assertFalse(backend.read_runtime_status()["ready"])
+
+    def test_real_glib_m1_precedes_native_request_in_same_batch(self):
+        try:
+            from gi.repository import GLib
+        except ImportError:
+            self.skipTest("GLib unavailable")
+        self.device("event5")
+        trigger = self.trigger()
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        trigger.device.read = lambda: os.read(read_fd, 1) and iter([
+            SimpleNamespace(type=1, code=187, value=1)])
+        order = []
+        trigger.toggle = lambda: order.append("M1")
+        # Queue the native notification first, then make the evdev source ready.
+        # Their callbacks are in the same batch; M1 must claim visibility first.
+        GLib.idle_add(lambda: order.append("native") or False, priority=GLib.PRIORITY_DEFAULT)
+        GLib.io_add_watch(read_fd, self.watches[0][1], GLib.IO_IN,
+                          lambda fd, condition: trigger.on_input(fd, condition) and False)
+        os.write(write_fd, b"1")
+        loop = GLib.MainContext.default()
+        for _ in range(10):
+            loop.iteration(False)
+            if len(order) == 2:
+                break
+        self.assertEqual(order, ["M1", "native"])
 
     def test_reconnect_while_m1_held_does_not_toggle(self):
         self.device("event5")

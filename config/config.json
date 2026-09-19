@@ -1,6 +1,6 @@
 {
   "layout": "full",
-  "super_icon": "windows",
+  "super_icon": "auto",
   "locale": "auto",
   "opacity": 0.72,
   "opacity_steps": [

@@ -42,7 +42,7 @@ DEFAULTS = {
     "layout": "full", "position_mode": "bottom", "color_theme": "midnight",
     "shift_preview": True,
     "dock_bottom_margin": 0,
-    "suggestion_count": 3, "gesture_fingers": 2, "super_icon": "windows",
+    "suggestion_count": 3, "gesture_fingers": 2, "super_icon": "auto",
 }
 
 # Boolean toggles, in display order: (config key, label).
@@ -68,7 +68,7 @@ CHOICE_SETTINGS = [
     ("dock_bottom_margin", "Bottom margin", "int", [(0, "0 px"), (20, "20 px"), (40, "40 px"), (60, "60 px"), (80, "80 px")]),
     ("suggestion_count", "Suggestions",     "int", [(2, "2"), (3, "3"), (4, "4"), (5, "5")]),
     ("gesture_fingers",  "Gesture fingers", "int", [(1, "1 finger"), (2, "2 fingers")]),
-    ("super_icon",       "Super key icon",  "str", [("windows", "Windows"), ("arch", "Arch"), ("tux", "Tux")]),
+    ("super_icon",       "Launcher key icon", "str", [("auto", "Automatic"), ("bazzite", "Bazzite"), ("windows", "Windows"), ("arch", "Arch"), ("tux", "Tux")]),
     ("size_level",       "Keyboard size",   "int", [(0, "1x"), (1, "2x"), (2, "3x"), (3, "4x")]),
     ("color_theme",      "Colour theme",    "str", [("midnight", "Midnight"), ("light", "Light"),
                                                     ("contrast", "High contrast"), ("nord", "Nord"),
