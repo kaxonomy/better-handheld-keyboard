@@ -100,7 +100,7 @@ def switch_to(code):
                 ["kreadconfig6", "--file", "kxkbrc", "--group", "Layout", "--key",
                  "LayoutList"], text=True, timeout=5).strip().split(",")
             idx = int(subprocess.check_output(
-                ["qdbus6", "org.kde.keyboard", "/Layouts",
+                [os.path.expanduser("~/.local/bin/handheld-kbd-dbus"), "org.kde.keyboard", "/Layouts",
                  "org.kde.KeyboardLayouts.getLayout"], text=True, timeout=5).strip())
             return ll[idx] if 0 <= idx < len(ll) else None
         except Exception:
@@ -109,7 +109,7 @@ def switch_to(code):
     for _ in range(30):
         if current() == code:
             return code
-        subprocess.run(["qdbus6", "org.kde.keyboard", "/Layouts",
+        subprocess.run([os.path.expanduser("~/.local/bin/handheld-kbd-dbus"), "org.kde.keyboard", "/Layouts",
                         "org.kde.KeyboardLayouts.switchToNextLayout"],
                        stdout=subprocess.DEVNULL, timeout=5)
         time.sleep(0.25)
@@ -135,7 +135,7 @@ def kwin_activate():
             '});')
     for args in (["unloadScript", "hk-activate"], ["loadScript", js, "hk-activate"],
                  ["start"]):
-        subprocess.run(["qdbus6", "org.kde.KWin", "/Scripting",
+        subprocess.run([os.path.expanduser("~/.local/bin/handheld-kbd-dbus"), "org.kde.KWin", "/Scripting",
                         "org.kde.kwin.Scripting." + args[0]] + args[1:],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
 

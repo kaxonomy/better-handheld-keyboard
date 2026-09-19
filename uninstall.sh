@@ -2,10 +2,15 @@
 # Remove Better Handheld Keyboard. Leaves your ~/.config/handheld-kbd/ config in place
 # (delete it yourself if you want it gone).
 set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+DBUS="$HERE/bin/handheld-kbd-dbus"
 RULE_UUID="a8a95de3-82aa-4998-87c0-125fb8525143"
 STEAM_RULE_UUID="6c4263a8-3263-4d41-85f7-75c704113edb"
 STEAM_RULES=( "$STEAM_RULE_UUID" 6c4263a8-3263-4d41-85f7-75c704113edc 6c4263a8-3263-4d41-85f7-75c704113edd )
 say() { printf '\033[1;36m::\033[0m %s\n' "$*"; }
+
+"$HERE/bin/handheld-kbd-recover" --restore-input-method-only || \
+  say "Could not restore the previous Plasma virtual keyboard. See the error above."
 
 say "Stopping running keyboard…"
 # Units first. They are what restarts the supervisor, so pkill on its own removes the
@@ -34,7 +39,7 @@ rm -rf "$HOME/.local/share/kwin/scripts/handheld-kbd-opacity"
 rm -rf "$HOME/.local/lib/handheld-kbd"          # the bundled suggestion filter
 # The script keeps running in the session after its files are gone — unload it, or the
 # desktop is still being driven by a keyboard that no longer exists.
-qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript handheld-kbd-opacity >/dev/null 2>&1 || true
+"$DBUS" org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript handheld-kbd-opacity >/dev/null 2>&1 || true
 
 # restore the hardware keyboard button (we remapped it via InputPlumber)
 if [ -f /usr/share/inputplumber/profiles/default.yaml ] && command -v busctl >/dev/null 2>&1; then
@@ -61,7 +66,7 @@ if command -v kwriteconfig6 >/dev/null 2>&1; then
   for rule in "$RULE_UUID" "${STEAM_RULES[@]}"; do
     kwriteconfig6 --file kwinrulesrc --group "$rule" --delete-group 2>/dev/null || true
   done
-  qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
+  "$DBUS" org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
 fi
 
 say "Removing /dev/uinput udev rule (one password prompt)…"

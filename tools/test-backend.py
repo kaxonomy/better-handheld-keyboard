@@ -30,15 +30,15 @@ def bitmap(*keys):
 
 
 class BackendTests(unittest.TestCase):
-    def test_dmi_requires_asus_and_rc72la(self):
-        self.assertTrue(backend.is_ally_x(DMI))
-        self.assertTrue(backend.is_ally_x({**DMI, "product_name": "ROG Ally X RC72LA_RC72LA_000123206"}))
-        self.assertFalse(backend.is_ally_x({**DMI, "sys_vendor": "Other", "board_vendor": "Other"}))
-        self.assertFalse(backend.is_ally_x({**DMI, "product_name": "ROG Ally RC71L", "board_name": "RC71L"}))
-        self.assertFalse(backend.is_ally_x({**DMI, "product_name": "RC72LAX", "board_name": "RC72LAX"}))
-        self.assertFalse(backend.is_ally_x({}))
+    def test_dmi_requires_asus_and_supported_ally(self):
+        self.assertTrue(backend.is_ally(DMI))
+        self.assertTrue(backend.is_ally({**DMI, "product_name": "ROG Ally X RC72LA_RC72LA_000123206"}))
+        self.assertFalse(backend.is_ally({**DMI, "sys_vendor": "Other", "board_vendor": "Other"}))
+        self.assertTrue(backend.is_ally({**DMI, "product_name": "ROG Ally RC71L_RC71L", "board_name": "RC71L"}))
+        self.assertFalse(backend.is_ally({**DMI, "product_name": "RC72LAX", "board_name": "RC72LAX"}))
+        self.assertFalse(backend.is_ally({}))
 
-    def detect(self, hhd_api=False, hhd_process=False, service=False, ip=False, cli=False, config=None):
+    def detect(self, hhd_api=False, hhd_process=False, service=False, ip=False, cli=False, config=None, dmi=DMI):
         def command(args):
             if args[0] == "systemctl":
                 return "hhd@user.service loaded active running" if service else ""
@@ -46,7 +46,7 @@ class BackendTests(unittest.TestCase):
         with patch.object(backend, "hhd_api_active", return_value=hhd_api), \
              patch.object(backend, "hhd_process_active", return_value=hhd_process), \
              patch.object(backend, "_command", side_effect=command), \
-             patch.object(backend, "read_dmi", return_value=DMI), \
+             patch.object(backend, "read_dmi", return_value=dmi), \
              patch.object(backend.shutil, "which", return_value="/usr/bin/inputplumber" if cli else None):
             return backend.detect_backend(config)
 
@@ -61,6 +61,8 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(self.detect(ip=True, hhd_api=True)["backend"], "hhd")
         self.assertEqual(self.detect(cli=True)["backend"], "generic")
         self.assertEqual(self.detect()["trigger"], "mirror")
+        self.assertEqual(self.detect(hhd_api=True, dmi={**DMI, "product_name": "ROG Ally RC71L_RC71L",
+                                                       "board_name": "RC71L"})["trigger"], "ally-m1")
 
     def test_recovery_override_preserves_backend_diagnostic(self):
         result = self.detect(hhd_api=True, config={"input_backend": "generic"})
@@ -125,11 +127,18 @@ class DeviceTests(unittest.TestCase):
 
     def test_only_targeted_asus_shortcut_interface_matches(self):
         self.device("event1", vendor="1234")
-        self.device("event2", product="1abe")
+        self.device("event2", product="1234")
         self.device("event3", keys=(187,))
         expected = self.device("event4")
         self.assertEqual(self.candidates(), [{"path": expected, "name": "Asus Keyboard"}])
         self.assertEqual(self.candidates({}), [])
+
+    def test_original_ally_uses_the_same_shortcut_backend(self):
+        expected = self.device("event7", product="1abe")
+        dmi = {**DMI, "product_name": "ROG Ally RC71L_RC71L", "board_name": "RC71L"}
+        self.assertEqual(self.candidates(dmi), [{"path": expected, "name": "Asus Keyboard"}])
+        trigger = self.trigger()
+        self.assertEqual(trigger.device.info.product, backend.ALLY_PRODUCT)
 
     def trigger(self):
         candidate_fn = backend.ally_devices
@@ -141,7 +150,8 @@ class DeviceTests(unittest.TestCase):
             def __init__(self, path):
                 owner.opened.append(path)
                 self.path, self.name, self.fd = path, "Asus Keyboard", 42
-                self.info = SimpleNamespace(vendor=backend.ASUS_VENDOR, product=backend.ALLY_X_PRODUCT)
+                product = int((owner.sysfs / Path(path).name / "device/id/product").read_text(), 16)
+                self.info = SimpleNamespace(vendor=backend.ASUS_VENDOR, product=product)
                 self.closed, self.events = False, []
             def active_keys(self): return owner.active
             def capabilities(self): return {backend.EV_KEY: [187, 188, 193]}

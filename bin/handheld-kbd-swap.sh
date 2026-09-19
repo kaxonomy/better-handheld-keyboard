@@ -66,10 +66,10 @@ steam_rule_mode() {
             kwriteconfig6 --file kwinrulesrc --group "$rule" --key "$key" "$1"
         done
     done
-    qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
+    "$HOME/.local/bin/handheld-kbd-dbus" org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
     STEAM_RULE_MODE=$1
 }
-trap 'steam_rule_mode 0; qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript handheld-kbd-opacity >/dev/null 2>&1 || true' EXIT
+trap 'steam_rule_mode 0; "$HOME/.local/bin/handheld-kbd-dbus" org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript handheld-kbd-opacity >/dev/null 2>&1 || true' EXIT
 trap 'exit 0' TERM INT
 
 update_steam_rule() {
@@ -88,9 +88,16 @@ write_opscript() {          # $1 = 1 to also force Steam's OSK transparent
 }
 
 load_opscript() {
-    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "handheld-kbd-opacity" >/dev/null 2>&1
-    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$OPSCRIPT" "handheld-kbd-opacity" >/dev/null 2>&1
-    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start >/dev/null 2>&1
+    local error
+    "$HOME/.local/bin/handheld-kbd-dbus" org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "handheld-kbd-opacity" >/dev/null 2>&1
+    if ! error=$("$HOME/.local/bin/handheld-kbd-dbus" org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$OPSCRIPT" "handheld-kbd-opacity" 2>&1) \
+       || ! error=$("$HOME/.local/bin/handheld-kbd-dbus" org.kde.KWin /Scripting org.kde.kwin.Scripting.start 2>&1); then
+        [ "${SCRIPT_LOAD_FAILED:-0}" = 1 ] || echo "KWIN HELPER FAILED $(date) $error" >>/tmp/swap-startup.log
+        SCRIPT_LOAD_FAILED=1
+        return 1
+    fi
+    [ "${SCRIPT_LOAD_FAILED:-0}" = 1 ] && echo "KWIN HELPER RECOVERED $(date)" >>/tmp/swap-startup.log
+    SCRIPT_LOAD_FAILED=0
 }
 
 FALLBACK=/tmp/handheld-kbd.mirror-fallback
@@ -176,7 +183,7 @@ while true; do
     refresh_keyboard_ready
     update_steam_rule
     # Self-heal: the KWin script's boot-time load can lose the race with KWin startup.
-    if [ "$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.isScriptLoaded handheld-kbd-opacity 2>/dev/null)" != "true" ]; then
+    if [ "$("$HOME/.local/bin/handheld-kbd-dbus" org.kde.KWin /Scripting org.kde.kwin.Scripting.isScriptLoaded handheld-kbd-opacity 2>/dev/null)" != "true" ]; then
         HIDE_STEAM=$(hide_steam_wanted)
         write_opscript "$HIDE_STEAM"
         load_opscript

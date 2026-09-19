@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Session DBus calls without depending on a distro-specific qdbus executable.
+
+Uses the same Gio dependency as the keyboard. Arguments follow qdbus:
+    handheld-kbd-dbus SERVICE PATH interface.method [arguments...]
+"""
+import sys
+import xml.etree.ElementTree as ET
+
+
+def method_info(xml, name, argument_count=None):
+    interface, _, method = name.rpartition(".")
+    matches = [(i.attrib["name"], m) for i in ET.fromstring(xml).findall("interface")
+               if not interface or i.attrib["name"] == interface
+               for m in i.findall("method") if m.attrib["name"] == method]
+    # Qt exports default arguments as overloads (KWin loadScript has one and two
+    # string forms). Select the signature for the arguments actually supplied.
+    if len(matches) > 1 and argument_count is not None:
+        matches = [(i, m) for i, m in matches
+                   if sum(a.get("direction", "in") == "in" for a in m.findall("arg")) == argument_count]
+    if len(matches) != 1:
+        raise ValueError("DBus method missing or ambiguous: " + name)
+    interface, method = matches[0]
+    return interface, method.attrib["name"], [a.attrib["type"] for a in method.findall("arg")
+                                            if a.get("direction", "in") == "in"]
+
+
+def call(service, path, method, args):
+    from gi.repository import Gio, GLib
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    xml = bus.call_sync(service, path, "org.freedesktop.DBus.Introspectable", "Introspect",
+                        None, None, Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]
+    interface, method, types = method_info(xml, method, len(args))
+    if len(args) != len(types):
+        raise ValueError("%s expects %s arguments, received %s" % (method, len(types), len(args)))
+    values = []
+    for signature, value in zip(types, args):
+        if signature in ("s", "o", "g"):
+            values.append(GLib.Variant(signature, value))
+        else:
+            values.append(GLib.Variant.parse(GLib.VariantType.new(signature), value, None, None))
+    params = GLib.Variant.new_tuple(*values) if values else None
+    return bus.call_sync(service, path, interface, method, params, None,
+                         Gio.DBusCallFlags.NONE, 2000, None).unpack()
+
+
+def print_values(values):
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            print_values(value)
+        else:
+            print(str(value).lower() if isinstance(value, bool) else value)
+
+
+def main(args):
+    if len(args) < 3:
+        print("usage: handheld-kbd-dbus SERVICE PATH interface.method [arguments...]", file=sys.stderr)
+        return 2
+    try:
+        print_values(call(args[0], args[1], args[2], args[3:]))
+    except Exception as ex:
+        print("handheld-kbd-dbus: %s" % ex, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

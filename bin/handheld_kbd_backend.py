@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runtime controller detection and the HHD Ally X Desktop Mode trigger."""
+"""Runtime controller detection and the HHD Ally Desktop Mode trigger."""
 import argparse
 import glob
 import http.client
@@ -17,7 +17,9 @@ import time
 # HHD's Ally driver uses this ASUS shortcut interface, separately from its gamepad.
 # https://github.com/hhd-dev/hhd/blob/master/src/hhd/device/rog_ally/base.py
 ASUS_VENDOR = 0x0b05
+ALLY_PRODUCT = 0x1abe
 ALLY_X_PRODUCT = 0x1b4c
+ALLY_PRODUCTS = (ALLY_PRODUCT, ALLY_X_PRODUCT)
 EV_KEY, EV_SYN, SYN_REPORT, SYN_DROPPED = 1, 0, 0, 3
 KEY_F17, KEY_F23 = 187, 193
 _keepalive = []
@@ -35,10 +37,10 @@ def read_dmi(root="/sys/class/dmi/id"):
             ("sys_vendor", "product_name", "board_vendor", "board_name")}
 
 
-def is_ally_x(dmi):
+def is_ally(dmi):
     vendor = (dmi.get("sys_vendor", "") + " " + dmi.get("board_vendor", "")).lower()
     model = (dmi.get("product_name", "") + " " + dmi.get("board_name", "")).upper()
-    return "asus" in vendor and bool(re.search(r"(?:^|[^A-Z0-9])RC72LA(?:$|[^A-Z0-9])", model))
+    return "asus" in vendor and bool(re.search(r"(?:^|[^A-Z0-9])(?:RC71L|RC72LA)(?:$|[^A-Z0-9])", model))
 
 
 def _command(args):
@@ -115,7 +117,7 @@ def detect_backend(config=None):
                           "s", "org.shadowblip.InputPlumber"]) == "b true"
     dmi = read_dmi()
     backend = choose_backend(bool(hhd_source), ip_active)
-    ally_m1 = backend == "hhd" and is_ally_x(dmi)
+    ally_m1 = backend == "hhd" and is_ally(dmi)
     override = (config or {}).get("input_backend", "auto")
     trigger = "ally-m1" if ally_m1 else ("inputplumber" if backend == "inputplumber" else "mirror")
     if override == "generic":
@@ -138,7 +140,7 @@ def _has_key(bitmap, code):
 
 def ally_devices(dmi, sysfs="/sys/class/input", devroot="/dev/input"):
     """Filter sysfs before opening anything; unrelated keyboards are never read."""
-    if not is_ally_x(dmi):
+    if not is_ally(dmi):
         return []
     devices = []
     for entry in sorted(Path(sysfs).glob("event*")):
@@ -147,7 +149,7 @@ def ally_devices(dmi, sysfs="/sys/class/input", devroot="/dev/input"):
             vendor = int(_read(device / "id/vendor"), 16)
             product = int(_read(device / "id/product"), 16)
             keys = _read(device / "capabilities/key")
-            if (vendor == ASUS_VENDOR and product == ALLY_X_PRODUCT and
+            if (vendor == ASUS_VENDOR and product in ALLY_PRODUCTS and
                     _has_key(keys, KEY_F17) and _has_key(keys, KEY_F23)):
                 devices.append({"path": str(Path(devroot) / entry.name), "name": _read(device / "name")})
         except ValueError:
@@ -248,7 +250,7 @@ class AllyM1Trigger:
                 device = self.input_device(candidate["path"])
                 keys = device.capabilities().get(EV_KEY, [])
                 # Recheck after open in case an event number was reused during discovery.
-                if (device.info.vendor != ASUS_VENDOR or device.info.product != ALLY_X_PRODUCT or
+                if (device.info.vendor != ASUS_VENDOR or device.info.product not in ALLY_PRODUCTS or
                         KEY_F17 not in keys or KEY_F23 not in keys):
                     device.close()
                     continue

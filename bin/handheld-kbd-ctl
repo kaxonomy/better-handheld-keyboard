@@ -18,6 +18,7 @@
 set -u
 
 BIN="$HOME/.local/bin"
+DBUS="$BIN/handheld-kbd-dbus"
 KBD_PAT='python3 .*handheld-kbd\.py'
 SUP_PAT='handheld-kbd-swap\.sh'
 
@@ -57,6 +58,7 @@ kill_pattern() {
 running() { pgrep -f "$1" >/dev/null 2>&1; }
 
 stop_all() {
+    local rule key
     systemctl --user stop handheld-kbd >/dev/null 2>&1
     kill_pattern "$SUP_PAT"           # supervisor first, or it respawns the keyboard
     sleep 0.5
@@ -67,7 +69,7 @@ stop_all() {
     done
     kill_pattern "$KBD_PAT" KILL
     rm -f /tmp/handheld-kbd-swap.lock
-    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript handheld-kbd-opacity >/dev/null 2>&1 || true
+    "$DBUS" org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript handheld-kbd-opacity >/dev/null 2>&1 || true
     # The pre-map Steam OSK rule must stand down with the replacement keyboard.
     if command -v kwriteconfig6 >/dev/null 2>&1; then
         for rule in 6c4263a8-3263-4d41-85f7-75c704113ed{b,c,d}; do
@@ -75,11 +77,12 @@ stop_all() {
                 kwriteconfig6 --file kwinrulesrc --group "$rule" --key "$key" 0
             done
         done
-        qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
+        "$DBUS" org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
     fi
 }
 
 start_all() {
+    local attempt
     # Start under the user service manager rather than from this shell. Run over SSH —
     # which is exactly where you end up when the keyboard is the problem — this shell has
     # no display and no session bus, and a keyboard inheriting that comes up unable to
@@ -93,18 +96,24 @@ start_all() {
     else
         setsid "$BIN/handheld-kbd-swap.sh" >>/tmp/handheld-kbd-out.log 2>&1 &
     fi
-    for _ in $(seq 40); do            # the supervisor spawns the keyboard itself
-        running "$KBD_PAT" && break
+    for attempt in $(seq 60); do
+        # A process exists before GTK/uinput/DBus initialization finishes. Wait for
+        # the service, or a following 'toggle show' races startup and fails.
+        if running "$KBD_PAT" && busctl --user --timeout=1 call org.handheld.Keyboard \
+            /org/handheld/Keyboard org.handheld.Keyboard GetTrigger >/dev/null 2>&1; then
+            return 0
+        fi
         sleep 0.25
     done
+    return 1
 }
 
 window_diagnostics() {
     local js name="hhkbd-diagnostics-$$" report
     report="$XDG_RUNTIME_DIR/handheld-kbd-windows.json"
     [ -d "$XDG_RUNTIME_DIR" ] || report="/tmp/handheld-kbd-$(id -u)-windows.json"
-    if ! command -v qdbus6 >/dev/null 2>&1; then
-        echo "KWin windows: unavailable (qdbus6 not installed)"
+    if [ ! -x "$DBUS" ]; then
+        echo "KWin windows: unavailable (handheld-kbd-dbus missing; rerun install.sh)"
         return 1
     fi
     js=$(mktemp --suffix=.js) || return 1
@@ -113,14 +122,14 @@ window_diagnostics() {
         return 1
     fi
     rm -f "$report"
-    if qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$js" "$name" >/dev/null 2>&1 \
-       && qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start >/dev/null 2>&1; then
+    if "$DBUS" org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$js" "$name" >/dev/null \
+       && "$DBUS" org.kde.KWin /Scripting org.kde.kwin.Scripting.start >/dev/null; then
         for _ in $(seq 20); do
             [ -s "$report" ] && break
             sleep 0.1
         done
     fi
-    qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$name" >/dev/null 2>&1 || true
+    "$DBUS" org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$name" >/dev/null 2>&1 || true
     rm -f "$js"
     if [ -s "$report" ]; then
         python3 -m json.tool "$report"
@@ -155,13 +164,24 @@ try:
 except (OSError, ValueError) as ex:
     print("config:     %s" % ex)
     c = {}
-print("session:    %s (%s)" % (os.environ.get("XDG_SESSION_TYPE", "unknown"),
+print("command session: %s (%s)" % (os.environ.get("XDG_SESSION_TYPE", "unknown"),
                                 os.environ.get("XDG_CURRENT_DESKTOP", "unknown")))
 print("Plasma:     %s" % probe(["plasmashell", "--version"]))
+dbus = os.path.expanduser("~/.local/bin/handheld-kbd-dbus")
+support = probe([dbus, "org.kde.KWin", "/KWin", "supportInformation"])
+for field in ("KWin version", "Operation Mode"):
+    match = re.search(r"^" + field + r":\s*(.*)$", support, re.MULTILINE)
+    print("%s: %s" % (field, match.group(1) if match else "unavailable"))
 print("DBus keyboard service: %s" % probe(["busctl", "--user", "call", "org.freedesktop.DBus",
       "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", "s", "org.handheld.Keyboard"]))
-print("KWin helper loaded: %s" % probe(["qdbus6", "org.kde.KWin", "/Scripting",
+print("KWin helper loaded: %s" % probe([dbus, "org.kde.KWin", "/Scripting",
       "org.kde.kwin.Scripting.isScriptLoaded", "handheld-kbd-opacity"]))
+print("Plasma input method: %s" % probe(["kreadconfig6", "--file", "kwinrc", "--group", "Wayland", "--key", "InputMethod"]))
+print("Plasma input-method bridge: %s" % probe(["busctl", "--user", "call", "org.freedesktop.DBus",
+      "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", "s", "org.handheld.Keyboard.InputMethod"]))
+for field in ("available", "enabled", "active", "visible"):
+    print("Plasma virtual keyboard %s: %s" % (field, probe(["busctl", "--user", "get-property",
+          "org.kde.KWin", "/VirtualKeyboard", "org.kde.kwin.VirtualKeyboard", field])))
 print("mirror setting: %s" % c.get("mirror", True))
 trigger = probe(["busctl", "--user", "call", "org.handheld.Keyboard", "/org/handheld/Keyboard",
                  "org.handheld.Keyboard", "GetTrigger"])
@@ -192,13 +212,11 @@ PY
         ;;
     start)
         stop_all                      # idempotent: never end up with two supervisors
-        start_all
-        running "$KBD_PAT" && echo "keyboard started." || { echo "keyboard did not start — see /tmp/handheld-kbd-out.log" >&2; exit 1; }
+        start_all && echo "keyboard started." || { echo "keyboard service did not start — see /tmp/handheld-kbd-out.log" >&2; exit 1; }
         ;;
     restart)
         stop_all
-        start_all
-        running "$KBD_PAT" && echo "keyboard restarted." || { echo "keyboard did not come back — see /tmp/handheld-kbd-out.log" >&2; exit 1; }
+        start_all && echo "keyboard restarted." || { echo "keyboard service did not come back — see /tmp/handheld-kbd-out.log" >&2; exit 1; }
         ;;
     reset)
         # Ask the running keyboard first so the change is visible immediately; fall
@@ -241,8 +259,7 @@ os.makedirs(os.path.dirname(p), exist_ok=True)
 json.dump(c, open(p, "w"), indent=2)
 PY
         stop_all
-        start_all
-        running "$KBD_PAT" && echo "super key icon set to $icon." \
+        start_all && echo "super key icon set to $icon." \
             || { echo "icon set; keyboard did not come back — see /tmp/handheld-kbd-out.log" >&2; exit 1; }
         ;;
     set)
@@ -294,8 +311,7 @@ with open(p + ".tmp", "w") as f:
 os.replace(p + ".tmp", p)
 PY
         stop_all
-        start_all
-        running "$KBD_PAT" && echo "$key set to $val." \
+        start_all && echo "$key set to $val." \
             || { echo "$key set; keyboard did not come back — see /tmp/handheld-kbd-out.log" >&2; exit 1; }
         ;;
     *)

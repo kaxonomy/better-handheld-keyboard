@@ -15,6 +15,7 @@ import gi, sys, time, os, signal, json, subprocess, math, re
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GLib, Pango, GdkPixbuf
 from evdev import UInput, ecodes as e
+DBUS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "handheld-kbd-dbus")
 GLib.set_prgname("handheld-kbd")   # app_id so the KWin window-rule can match us
 
 CFG_DIR = os.path.expanduser("~/.config/handheld-kbd")
@@ -340,7 +341,7 @@ def active_layout_code():
         # a(sss): triplets of (code, variant, display name), every string quoted.
         codes = out.split('"')[1::2][0::3]
         idx = int(subprocess.check_output(
-            ["qdbus6", "org.kde.keyboard", "/Layouts", "org.kde.KeyboardLayouts.getLayout"],
+            [DBUS, "org.kde.keyboard", "/Layouts", "org.kde.KeyboardLayouts.getLayout"],
             text=True, timeout=3).strip())
         if codes:
             return codes[idx] if 0 <= idx < len(codes) else codes[0]
@@ -1074,7 +1075,7 @@ class OSK(Gtk.Window):
             return
         before = active_layout_code()
         try:
-            subprocess.run(["qdbus6", "org.kde.keyboard", "/Layouts",
+            subprocess.run([DBUS, "org.kde.keyboard", "/Layouts",
                             "org.kde.KeyboardLayouts.switchToNextLayout"], timeout=3)
         except Exception as ex:
             print(f"handheld-kbd: layout switch failed ({ex})", file=sys.stderr)
@@ -1175,7 +1176,7 @@ class OSK(Gtk.Window):
                      ["loadScript", opscript, "handheld-kbd-opacity"],
                      ["start"]):
             try:
-                subprocess.run(["qdbus6", "org.kde.KWin", "/Scripting", S + args[0]] + args[1:],
+                subprocess.run([DBUS, "org.kde.KWin", "/Scripting", S + args[0]] + args[1:],
                                check=False, timeout=3)
             except Exception:
                 pass
@@ -1366,7 +1367,7 @@ class OSK(Gtk.Window):
             for key in ("positionrule", "sizerule"):
                 subprocess.run(["kwriteconfig6", "--file", "kwinrulesrc", "--group", rid,
                                 "--key", key, str(mode)], check=False, timeout=3)
-            subprocess.run(["qdbus6", "org.kde.KWin", "/KWin", "reconfigure"],
+            subprocess.run([DBUS, "org.kde.KWin", "/KWin", "reconfigure"],
                            check=False, timeout=3)
             return True
         except Exception as ex:
@@ -1394,7 +1395,7 @@ class OSK(Gtk.Window):
             S = "org.kde.kwin.Scripting."
             name = "handheld-kbd-report"
             for args in (["unloadScript", name], ["loadScript", js, name], ["start"]):
-                subprocess.run(["qdbus6", "org.kde.KWin", "/Scripting", S + args[0]] + args[1:],
+                subprocess.run([DBUS, "org.kde.KWin", "/Scripting", S + args[0]] + args[1:],
                                check=False, timeout=3)
         except Exception as ex:
             print(f"handheld-kbd: geometry request failed ({ex})", file=sys.stderr)
@@ -1444,7 +1445,7 @@ class OSK(Gtk.Window):
                 for key in ("acceptfocusrule", "opacityactiverule", "opacityinactiverule"):
                     subprocess.run(["kwriteconfig6", "--file", "kwinrulesrc", "--group", rule,
                                     "--key", key, "2"], check=True, timeout=3)
-            subprocess.run(["qdbus6", "org.kde.KWin", "/KWin", "reconfigure"],
+            subprocess.run([DBUS, "org.kde.KWin", "/KWin", "reconfigure"],
                            check=True, timeout=3)
         except Exception as ex:
             print(f"handheld-kbd: HHD trigger protection unavailable ({ex}); using mirror fallback", file=sys.stderr)
@@ -1471,7 +1472,7 @@ class OSK(Gtk.Window):
             for args in (["unloadScript", "handheld-kbd-opacity"],
                          ["loadScript", opscript, "handheld-kbd-opacity"],
                          ["start"]):
-                subprocess.run(["qdbus6", "org.kde.KWin", "/Scripting", S + args[0]] + args[1:],
+                subprocess.run([DBUS, "org.kde.KWin", "/Scripting", S + args[0]] + args[1:],
                                check=False, timeout=3)
         except Exception as ex:
             print(f"handheld-kbd: kwin script reload failed ({ex})", file=sys.stderr)
@@ -1746,7 +1747,7 @@ class OSK(Gtk.Window):
             for key, val in (("position", f"{g['x']},{g['y']}"), ("size", f"{g['w']},{g['h']}")):
                 subprocess.run(["kwriteconfig6", "--file", "kwinrulesrc", "--group", rid,
                                 "--key", key, val], check=False, timeout=3)
-            subprocess.run(["qdbus6", "org.kde.KWin", "/KWin", "reconfigure"],
+            subprocess.run([DBUS, "org.kde.KWin", "/KWin", "reconfigure"],
                            check=False, timeout=3)
         except Exception as ex:
             print(f"handheld-kbd: kwin geometry update failed ({ex})", file=sys.stderr)
@@ -1864,6 +1865,9 @@ SERVICE_XML = """
     <method name='Show'/>
     <method name='Hide'/>
     <method name='Toggle'/>
+    <method name='InputMethod'>
+      <arg type='b' name='visible' direction='in'/>
+    </method>
     <method name='FreeMove'/>
     <method name='Reset'/>
     <method name='SetGeometry'>
@@ -1886,7 +1890,7 @@ _service_keepalive = []
 
 
 def setup_service(show, hide, toggle, set_geometry=None, free_move=None, reset=None,
-                  next_geometry=None, ready=None):
+                  next_geometry=None, ready=None, input_method=None):
     """Expose Show/Hide/Toggle on the session bus.
 
     This is what replaced polling. The KWin script calls these the moment Steam's
@@ -1901,7 +1905,9 @@ def setup_service(show, hide, toggle, set_geometry=None, free_move=None, reset=N
 
     def on_call(conn, sender, path, iface, method, params, invocation):
         try:
-            if method == "SetGeometry" and set_geometry is not None:
+            if method == "InputMethod" and input_method is not None:
+                input_method(params.unpack()[0])
+            elif method == "SetGeometry" and set_geometry is not None:
                 set_geometry(params.unpack()[0])
             elif method == "NextGeometry":
                 invocation.return_value(GLib.Variant("(s)", (next_geometry() if next_geometry else "",)))
@@ -1994,7 +2000,7 @@ def setup_focus_trigger(config, show):
     if not os.environ.get("AT_SPI_BUS_ADDRESS"):
         try:
             addr = subprocess.check_output(
-                ["qdbus6", "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus.GetAddress"],
+                [DBUS, "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus.GetAddress"],
                 text=True, timeout=3).strip()
             if addr:
                 os.environ["AT_SPI_BUS_ADDRESS"] = addr
@@ -2250,7 +2256,7 @@ def main():
     open("/tmp/handheld-kbd.pid", "w").write(str(os.getpid()))
     VIS = "/tmp/handheld-kbd.vis"
 
-    state = {"shown": False}
+    state = {"shown": False, "automatic": False, "input_method": False}
 
     def _setvis(v):
         # The file is for the daemon's benefit; the in-memory flag is what we act on, so a
@@ -2260,6 +2266,7 @@ def main():
         except Exception: pass
 
     def _show(*_):
+        state["automatic"] = False
         if state["shown"]:
             return True                   # already up: nothing to do, no flicker
         # Placement is compositor work (rule writes, script reloads); doing it on every
@@ -2275,7 +2282,25 @@ def main():
         if not state["shown"]:
             return True
         if GAMEMODE: w.gm_hide()
-        w.hide(); _setvis("0"); return True
+        w.hide(); _setvis("0")
+        state["automatic"] = False
+        if state["input_method"]:
+            # Dismiss this text-input context without disabling Plasma's provider.
+            # The next tap on the same field can then summon the keyboard again.
+            from gi.repository import Gio
+            def dismissed(conn, result):
+                try:
+                    conn.call_finish(result)
+                except GLib.Error as ex:
+                    w._debug("input-method dismissal failed: " + str(ex))
+            try:
+                bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+                bus.call("org.handheld.Keyboard.InputMethod", "/org/handheld/Keyboard/InputMethod",
+                         "org.handheld.Keyboard.InputMethod", "Dismiss", None, None,
+                         Gio.DBusCallFlags.NO_AUTO_START, 2000, None, dismissed)
+            except GLib.Error as ex:
+                w._debug("input-method dismissal failed: " + str(ex))
+        return True
     w.hide_cb = _hide                 # the hide key routes through here, so state stays in sync
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, _show, None)
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, _hide, None)
@@ -2283,6 +2308,23 @@ def main():
     def _toggle():
         w._debug("toggle requested")
         (_hide if state["shown"] else _show)()
+
+    def _input_method(visible):
+        if visible == state["input_method"]:
+            return
+        state["input_method"] = visible
+        if visible:
+            if not state["shown"]:
+                _show()
+                state["automatic"] = True
+        else:
+            def hide_automatic():
+                if not state["input_method"] and state["automatic"]:
+                    _hide()
+                return False
+            # Moving between text fields can deactivate/reactivate the protocol
+            # in one gesture. Never hide a keyboard opened manually by M1.
+            GLib.timeout_add(150, hide_automatic)
 
     def _focus_show():
         if not state["shown"]:            # show-only, idempotent (no auto-hide)
@@ -2303,7 +2345,7 @@ def main():
     # the pre-map Steam focus rules enabled before it can send its first Toggle.
     setup_service(_show, _hide, _toggle, w.set_reported_geometry,
                   lambda: w.on_move(None), lambda: w.on_reset(None), w.next_geometry,
-                  _setup_input_backend)
+                  _setup_input_backend, _input_method)
     if GAMEMODE:
         setup_dbus_trigger(config, _toggle)
     setup_hotkey(config, _toggle)         # optional evdev hotkey (attached kbd / Steam Input chord)

@@ -5,6 +5,7 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+DBUS="$HERE/bin/handheld-kbd-dbus"
 BIN="$HOME/.local/bin"
 CFG="$HOME/.config/handheld-kbd"
 SHARE="$HOME/.local/share/handheld-kbd"
@@ -90,6 +91,8 @@ install -m755 "$HERE/bin/handheld-kbd-recover"   "$BIN/"
 install -m755 "$HERE/bin/handheld-kbd-dock-rect" "$BIN/"
 install -m755 "$HERE/bin/handheld-kbd-install-filter" "$BIN/"
 install -m755 "$HERE/bin/handheld-kbd-toggle" "$BIN/"
+install -m755 "$HERE/bin/handheld-kbd-dbus" "$BIN/"
+install -m755 "$HERE/bin/handheld-kbd-input-method" "$BIN/"
 install -m755 "$HERE/bin/handheld-kbd-ctl" "$BIN/"
 install -m755 "$HERE/bin/handheld-kbd-locales" "$BIN/"
 install -m755 "$HERE/bin/handheld-kbd-tray" "$BIN/"
@@ -282,6 +285,46 @@ for s in "$HERE"/shortcuts/*.desktop; do
 done
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS" 2>/dev/null
 
+# KWin owns text-field activation on Wayland. Register our input-method provider so a
+# touchscreen tap can summon the same keyboard, including when installing from a tty.
+if command -v kwriteconfig6 >/dev/null 2>&1 && command -v kreadconfig6 >/dev/null 2>&1 && \
+   "$DBUS" org.kde.KWin /KWin supportInformation 2>/dev/null | grep -Eq 'Operation Mode: (Xwayland|Wayland)'; then
+  python3 - "$CFG/plasma-input-method.json" "$APPS/handheld-kbd-input-method.desktop" "$DBUS" <<'PY' || warn "Could not select the Plasma touch keyboard."
+import json, os, subprocess, sys
+
+backup, provider, dbus = sys.argv[1:]
+keys = ("InputMethod", "VirtualKeyboardEnabled", "VirtualKeyboardMode")
+missing = "__handheld_kbd_unset__"
+def read(key):
+    value = subprocess.check_output(["kreadconfig6", "--file", "kwinrc", "--group", "Wayland",
+                                     "--key", key, "--default", missing], text=True).strip()
+    return None if value == missing else value
+
+current = read("InputMethod")
+if not os.path.exists(backup):
+    previous = {key: read(key) for key in keys}
+    if current == provider:
+        previous["InputMethod"] = None
+    with open(backup + ".tmp", "w") as f:
+        json.dump(previous, f)
+    os.replace(backup + ".tmp", backup)
+elif current != provider:
+    print("handheld-kbd: keeping your selected Plasma virtual keyboard; Better Handheld Keyboard is available in System Settings.")
+    sys.exit(0)
+for key, value in zip(keys, (provider, "true", "1")):
+    subprocess.run(["kwriteconfig6", "--notify", "--file", "kwinrc", "--group", "Wayland",
+                    "--key", key, value], check=True)
+call = [dbus, "org.kde.KWin", "/VirtualKeyboard", "org.freedesktop.DBus.Properties.Set",
+        "org.kde.kwin.VirtualKeyboard"]
+if subprocess.run(call + ["enabled", "<true>"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+    subprocess.run(call + ["mode", "<1>"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print("handheld-kbd: Plasma touchscreen text fields now use Better Handheld Keyboard.")
+PY
+  "$DBUS" org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
+else
+  say "Plasma touch provider installed; select Better Handheld Keyboard in Virtual Keyboard settings when using Plasma Wayland."
+fi
+
 # --- KWin window rules (no focus-steal; geometry belongs to the script) ---
 if command -v kwriteconfig6 >/dev/null 2>&1; then
   K=( kwriteconfig6 --file kwinrulesrc --group "$RULE_UUID" --key )
@@ -329,7 +372,7 @@ if command -v kwriteconfig6 >/dev/null 2>&1; then
   kwriteconfig6 --file kwinrulesrc --group General --key rules "$cur"
   kwriteconfig6 --file kwinrulesrc --group General --key count \
     "$(printf '%s' "$cur" | tr ',' '\n' | grep -c .)"
-  qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
+  "$DBUS" org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
 fi
 
 # The privileged step now happens near the top, before anything is touched — see

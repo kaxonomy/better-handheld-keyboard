@@ -16,7 +16,7 @@ import subprocess
 if not os.environ.get("AT_SPI_BUS_ADDRESS"):
     try:
         addr = subprocess.check_output(
-            ["qdbus6", "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus.GetAddress"],
+            [os.path.join(os.path.dirname(os.path.abspath(__file__)), "handheld-kbd-dbus"), "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus.GetAddress"],
             text=True, timeout=3).strip()
         if addr:
             os.environ["AT_SPI_BUS_ADDRESS"] = addr

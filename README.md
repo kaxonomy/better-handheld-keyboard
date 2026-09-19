@@ -101,9 +101,9 @@ out and back in**.
 
 Prefer the terminal? `./install.sh`, then log out and back in.
 
-### ROG Ally X / Bazzite / HHD
+### ROG Ally / Ally X / Bazzite / HHD
 
-On an ASUS ROG Ally X (RC72LA) running Plasma 6 Desktop Mode, the keyboard detects
+On an ASUS ROG Ally (RC71L) or Ally X (RC72LA) running Plasma 6 Desktop Mode, the keyboard detects
 the running controller service. HHD does not require an InputPlumber CLI or Steam
 Input. M1 toggles this keyboard directly; M2 keeps its HHD behaviour. Re-running
 `./install.sh` upgrades the programs and rules while preserving your settings.
@@ -119,6 +119,21 @@ the same press cannot toggle twice. Device discovery repeats after disconnects.
 This follows HHD's [Ally driver](https://github.com/hhd-dev/hhd/blob/master/src/hhd/device/rog_ally/base.py)
 and [paddle actions](https://github.com/hhd-dev/hhd/blob/master/src/hhd/controller/base.py);
 no HHD configuration or system files are changed.
+
+Both Ally models use the same backend. KWin calls use the keyboard's existing
+Python DBus support; the `qdbus6` executable is not required.
+
+On Plasma Wayland, the installer also selects **Better Handheld Keyboard** as
+the virtual keyboard. Tapping a text field then opens this keyboard through
+KWin's native input-method interface. Leave that provider selected in System
+Settings → Virtual Keyboard; **None** disables tap activation. Upgrades preserve
+a later provider change made in Settings. Uninstall and
+`handheld-kbd-recover --stock-only` restore the previous provider.
+
+Tap activation requires the application to support Wayland text input. M1 and
+the usual toggle shortcut remain available in applications that do not. Closing
+an automatically opened keyboard allows another tap to open it again. A change
+of text-field focus does not hide a keyboard opened manually with M1.
 
 The nonexclusive listener does not consume the original hardware F17 event. It
 never re-injects F17, and does not watch F17 on unrelated keyboards. Avoid binding
@@ -170,6 +185,8 @@ handheld-kbd-ctl set debug false bool
 
 `status` / `diagnostics` reports the backend, DMI, session, service readiness,
 selected M1 device, placement and live Steam window metadata without root. It
+also reports KWin's actual session mode separately from the command's session
+(which may be a tty), and the selected Plasma provider and its live state. It
 does not log typed keys or text. Unmatched Steam windows omit their captions to
 avoid recording chat/browser text.
 
@@ -192,6 +209,12 @@ Acceptance check on the handheld (Steam Input can stay disabled):
    all four sizes: `handheld-kbd-ctl windows` should report `bottomMargin: 40`.
 7. Suspend/resume, repeat M1 show/hide, and inspect diagnostics for the selected
    event device. No InputPlumber installation is needed.
+8. With **Better Handheld Keyboard** selected in Plasma's Virtual Keyboard
+   settings, tap a Wayland Qt/GTK/browser text field. Only this keyboard should
+   open. Type, close it, and tap the same field again. Repeat after restarting
+   the keyboard. Clicking with a mouse should follow Plasma's normal touch-only
+   activation policy. Check that M1 still works in applications without native
+   text-input support.
 
 These hardware checks require an actual Plasma/Ally session. Unknown future Steam
 OSK metadata may require updating the matcher and pre-map rule; use `windows` to
@@ -204,6 +227,9 @@ Local regression checks (Node.js is only needed for the KWin mock test):
 python3 tools/test-backend.py
 python3 tools/test-movement.py
 python3 tools/test-install.py
+python3 tools/test-controls.py
+python3 tools/test-dbus.py
+python3 tools/test-input-method.py
 node tools/test-kwin.js
 ```
 

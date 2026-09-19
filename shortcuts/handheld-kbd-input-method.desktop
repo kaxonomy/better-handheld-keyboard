@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Better Handheld Keyboard
+Exec=__BIN__/handheld-kbd-input-method
+Icon=input-keyboard-virtual
+X-KDE-Wayland-VirtualKeyboard=true
+NoDisplay=true

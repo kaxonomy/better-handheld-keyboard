@@ -17,8 +17,8 @@
 # and nothing else on the machine is disturbed.
 set -u
 
-if ! command -v qdbus6 >/dev/null 2>&1; then
-    echo "!! qdbus6 not found — this needs KDE Plasma 6" >&2
+if [ ! -x "$HOME/.local/bin/handheld-kbd-dbus" ]; then
+    echo "!! handheld-kbd-dbus not found — re-run ./install.sh" >&2
     exit 1
 fi
 
@@ -27,13 +27,13 @@ trap 'rm -f "$JS"' EXIT
 "$HOME/.local/bin/handheld-kbd-kwin-script" --close-steam --out "$JS" || exit 1
 
 echo ":: closing Steam's on-screen keyboard…"
-qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript hhkbd-close-osk >/dev/null 2>&1
-qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$JS" hhkbd-close-osk >/dev/null 2>&1 \
+"$HOME/.local/bin/handheld-kbd-dbus" org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript hhkbd-close-osk >/dev/null 2>&1
+"$HOME/.local/bin/handheld-kbd-dbus" org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$JS" hhkbd-close-osk >/dev/null 2>&1 \
     || { echo "handheld-kbd: could not load Steam OSK cleanup helper" >&2; exit 1; }
-qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.start >/dev/null 2>&1 \
+"$HOME/.local/bin/handheld-kbd-dbus" org.kde.KWin /Scripting org.kde.kwin.Scripting.start >/dev/null 2>&1 \
     || { echo "handheld-kbd: could not start Steam OSK cleanup helper" >&2; exit 1; }
 sleep 1
-qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript hhkbd-close-osk >/dev/null 2>&1
+"$HOME/.local/bin/handheld-kbd-dbus" org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript hhkbd-close-osk >/dev/null 2>&1
 
 echo ":: done — the trackpad and stick pointer should work again."
 echo

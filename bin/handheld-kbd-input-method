@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""KWin's Wayland input-method-v1 provider; the existing keyboard keeps rendering.
+
+KWin starts this process with its private WAYLAND_SOCKET. Never pass that socket
+to GTK or grab the physical keyboard: typing still uses the existing uinput path.
+Protocol: wayland-protocols/unstable/input-method/input-method-unstable-v1.xml.
+"""
+import ctypes as C
+import errno
+import json
+import os
+import signal
+import sys
+
+
+class Interface(C.Structure):
+    pass
+
+
+class Message(C.Structure):
+    _fields_ = [("name", C.c_char_p), ("signature", C.c_char_p),
+                ("types", C.POINTER(C.POINTER(Interface)))]
+
+
+Interface._fields_ = [("name", C.c_char_p), ("version", C.c_int),
+                     ("method_count", C.c_int), ("methods", C.POINTER(Message)),
+                     ("event_count", C.c_int), ("events", C.POINTER(Message))]
+
+# Only destroy is sent. All six context events must be declared, even though we
+# deliberately discard surrounding text, language and composition state.
+_requests = (Message * 1)(Message(b"destroy", b"", None))
+_events = (Message * 6)(*[Message(name, signature, None) for name, signature in (
+    (b"surrounding_text", b"suu"), (b"reset", b""), (b"content_type", b"uu"),
+    (b"invoke_action", b"uu"), (b"commit_state", b"u"), (b"preferred_language", b"s"))])
+CONTEXT = Interface(b"zwp_input_method_context_v1", 1, 1, _requests, 6, _events)
+_context_type = (C.POINTER(Interface) * 1)(C.pointer(CONTEXT))
+_method_events = (Message * 2)(Message(b"activate", b"n", _context_type),
+                             Message(b"deactivate", b"o", _context_type))
+INPUT_METHOD = Interface(b"zwp_input_method_v1", 1, 0, None, 2, _method_events)
+_panel_requests = (Message * 2)(Message(b"set_toplevel", b"ou", None),
+                              Message(b"set_overlay_panel", b"", None))
+_toplevel_types = (C.POINTER(Interface) * 2)(None, None)
+_panel_requests[0].types = _toplevel_types
+PANEL_SURFACE = Interface(b"zwp_input_panel_surface_v1", 1, 2, _panel_requests, 0, None)
+_panel_types = (C.POINTER(Interface) * 2)(C.pointer(PANEL_SURFACE), None)
+_panel_get = (Message * 1)(Message(b"get_input_panel_surface", b"no", _panel_types))
+INPUT_PANEL = Interface(b"zwp_input_panel_v1", 1, 1, _panel_get, 0, None)
+
+
+class InputMethod:
+    def __init__(self, notify, failed, debug=False, panel_changed=None):
+        self.notify, self.failed, self.debug = notify, failed, debug
+        self.panel_changed = panel_changed
+        self.context = None
+        self.method = None
+        self.surface = None
+        self.globals = {}
+        self.listeners = []
+        self.context_listener = None
+        self.lib = C.CDLL("libwayland-client.so.0", use_errno=True)
+        signatures = {
+            "wl_display_connect_to_fd": (C.c_void_p, [C.c_int]),
+            "wl_display_get_fd": (C.c_int, [C.c_void_p]),
+            "wl_display_dispatch": (C.c_int, [C.c_void_p]),
+            "wl_display_roundtrip": (C.c_int, [C.c_void_p]),
+            "wl_display_flush": (C.c_int, [C.c_void_p]),
+            "wl_display_disconnect": (None, [C.c_void_p]),
+            "wl_proxy_add_listener": (C.c_int, [C.c_void_p, C.POINTER(C.c_void_p), C.c_void_p]),
+            "wl_proxy_destroy": (None, [C.c_void_p]),
+            "wl_proxy_marshal_flags": (C.c_void_p, [C.c_void_p, C.c_uint,
+                                       C.POINTER(Interface), C.c_uint, C.c_uint]),
+        }
+        for name, (result, args) in signatures.items():
+            fn = getattr(self.lib, name)
+            fn.restype, fn.argtypes = result, args
+        self.core = {name: Interface.in_dll(self.lib, name + "_interface") for name in (
+            "wl_registry", "wl_compositor", "wl_shm", "wl_shm_pool", "wl_buffer",
+            "wl_surface", "wl_region", "wl_output", "wl_callback")}
+        _panel_types[1] = C.pointer(self.core["wl_surface"])
+        _toplevel_types[0] = C.pointer(self.core["wl_output"])
+        # Only KWin may launch the provider. A normal WAYLAND_DISPLAY connection
+        # cannot see the privileged input-method global.
+        fd = int(os.environ.pop("WAYLAND_SOCKET"))
+        os.set_inheritable(fd, False)
+        os.environ.pop("WAYLAND_DEBUG", None)  # protocol dumps include surrounding text
+        self.display = self.lib.wl_display_connect_to_fd(fd)
+        if not self.display:
+            raise OSError("could not connect to KWin's input-method socket")
+        self.registry = self.lib.wl_proxy_marshal_flags(
+            self.display, 1, C.byref(self.core["wl_registry"]), 1, 0, C.c_void_p())
+        self._listen(self.registry, [
+            (self._global, (C.c_uint, C.c_char_p, C.c_uint)),
+            (self._removed, (C.c_uint,))])
+        if self.lib.wl_display_roundtrip(self.display) < 0 or not self.method:
+            raise RuntimeError("KWin did not offer zwp_input_method_v1")
+        if not all(name in self.globals for name in ("wl_compositor", "wl_shm", "wl_output", "zwp_input_panel_v1")):
+            raise RuntimeError("KWin did not offer the input-panel interfaces")
+        fd = os.memfd_create("handheld-kbd-input-panel", os.MFD_CLOEXEC)
+        try:
+            os.ftruncate(fd, 4)  # one transparent ARGB pixel, zero initialized
+            pool = self._new(self.globals["wl_shm"], 0, self.core["wl_shm_pool"], C.c_int(fd), C.c_int(4))
+            self.buffer = self._new(pool, 0, self.core["wl_buffer"], C.c_int(0), C.c_int(1),
+                                    C.c_int(1), C.c_int(4), C.c_uint(0))
+            self._listen(self.buffer, [(lambda *_: None, ())])
+            self.lib.wl_proxy_marshal_flags(pool, 1, None, 1, 1)
+        finally:
+            os.close(fd)
+        if self.context:
+            self._map_panel()
+        if self.lib.wl_display_roundtrip(self.display) < 0:
+            raise RuntimeError("KWin input-method registration failed")
+
+    def _listen(self, proxy, handlers):
+        def guarded(fn):
+            def call(*args):
+                try:
+                    fn(*args)
+                except Exception as ex:
+                    self.failed("input-method event failed: " + str(ex))
+            return call
+        callbacks = [C.CFUNCTYPE(None, C.c_void_p, C.c_void_p, *args)(guarded(fn))
+                     for fn, args in handlers]
+        listener = (C.c_void_p * len(callbacks))(*[C.cast(fn, C.c_void_p) for fn in callbacks])
+        self.listeners.append((callbacks, listener))
+        if self.lib.wl_proxy_add_listener(proxy, listener, None) < 0:
+            raise RuntimeError("could not attach the Wayland input-method listener")
+        return self.listeners[-1]
+
+    def _new(self, parent, opcode, interface, *args):
+        return self.lib.wl_proxy_marshal_flags(parent, opcode, C.byref(interface), 1, 0, C.c_void_p(), *args)
+
+    def _global(self, data, registry, name, interface, version):
+        name_string = interface.decode("ascii")
+        wanted = {"zwp_input_method_v1": INPUT_METHOD, "zwp_input_panel_v1": INPUT_PANEL,
+                  **{key: self.core[key] for key in ("wl_compositor", "wl_shm", "wl_output")}}
+        if name_string in wanted and name_string not in self.globals:
+            proxy = self.lib.wl_proxy_marshal_flags(
+                registry, 0, C.byref(wanted[name_string]), 1, 0, C.c_uint(name),
+                C.c_char_p(interface), C.c_uint(1), C.c_void_p())
+            self.globals[name_string] = proxy
+            if interface == b"zwp_input_method_v1":
+                self.global_name, self.method = name, proxy
+                self._listen(proxy, [(self._activate, (C.c_void_p,)), (self._deactivate, (C.c_void_p,))])
+            elif interface == b"wl_shm":
+                self._listen(proxy, [(lambda *_: None, (C.c_uint,))])
+            elif interface == b"wl_output":
+                self._listen(proxy, [(lambda *_: None, (C.c_int, C.c_int, C.c_int, C.c_int,
+                                                       C.c_int, C.c_void_p, C.c_void_p, C.c_int)),
+                                     (lambda *_: None, (C.c_uint, C.c_int, C.c_int, C.c_int))])
+
+    def _removed(self, data, registry, name):
+        if name == getattr(self, "global_name", None):
+            self.failed("KWin removed the input-method interface")
+
+    def _activate(self, data, method, context):
+        self.context = context
+        # Strings remain opaque pointers: do not decode, retain, or log user text.
+        self.context_listener = self._listen(context, [(lambda *_: None, args) for args in (
+            (C.c_void_p, C.c_uint, C.c_uint), (), (C.c_uint, C.c_uint),
+            (C.c_uint, C.c_uint), (C.c_uint,), (C.c_void_p,))])
+        if self.debug:
+            print("handheld-kbd: Plasma text input activated", file=sys.stderr)
+        if hasattr(self, "buffer"):
+            self._map_panel()
+
+    def _map_panel(self):
+        # The empty input region gives KWin an empty frame geometry, so the marker
+        # neither catches taps nor shifts application windows. Its transparent
+        # buffer only lets KWin apply its native touch/show/hide panel policy.
+        self.surface = self._new(self.globals["wl_compositor"], 0, self.core["wl_surface"])
+        self.surface_listener = self._listen(self.surface, [(lambda *_: None, (C.c_void_p,))] * 2)
+        region = self._new(self.globals["wl_compositor"], 1, self.core["wl_region"])
+        self.lib.wl_proxy_marshal_flags(self.surface, 5, None, 1, 0, C.c_void_p(region))
+        self.lib.wl_proxy_marshal_flags(region, 0, None, 1, 1)
+        self.panel = self._new(self.globals["zwp_input_panel_v1"], 0, PANEL_SURFACE, C.c_void_p(self.surface))
+        self.lib.wl_proxy_marshal_flags(self.panel, 0, None, 1, 0, C.c_void_p(self.globals["wl_output"]), C.c_uint(0))
+        self.lib.wl_proxy_marshal_flags(self.surface, 1, None, 1, 0, C.c_void_p(self.buffer), C.c_int(0), C.c_int(0))
+        self.lib.wl_proxy_marshal_flags(self.surface, 6, None, 1, 0)
+        # Plasma 6.4 did not signal visibleChanged when a panel first became
+        # ready. Read visibility after KWin has processed the surface commit.
+        if self.panel_changed:
+            callback = self._new(self.display, 0, self.core["wl_callback"])
+            def mapped(data, proxy, serial):
+                self.lib.wl_proxy_destroy(proxy)
+                self.listeners.remove(listener)
+                self.panel_changed()
+            listener = self._listen(callback, [(mapped, (C.c_uint,))])
+
+    def _deactivate(self, data, method, context):
+        # Destroy the context after deactivation as required by input-method-v1.
+        self.lib.wl_proxy_marshal_flags(context, 0, None, 1, 1)
+        if context == self.context:
+            if self.surface:
+                self.lib.wl_proxy_marshal_flags(self.surface, 0, None, 1, 1)
+                self.lib.wl_proxy_destroy(self.panel)
+                self.listeners.remove(self.surface_listener)
+            self.listeners.remove(self.context_listener)
+            self.surface = None
+            self.context = None
+            if self.debug:
+                print("handheld-kbd: Plasma text input deactivated", file=sys.stderr)
+            self.notify(False)
+
+    def close(self):
+        self.lib.wl_display_disconnect(self.display)
+
+
+def main():
+    if "WAYLAND_SOCKET" not in os.environ:
+        print("handheld-kbd: select Better Handheld Keyboard in Plasma's Virtual Keyboard settings",
+              file=sys.stderr)
+        return 1
+    from gi.repository import Gio, GLib
+    debug = False
+    try:
+        with open(os.path.expanduser("~/.config/handheld-kbd/config.json")) as f:
+            debug = bool(json.load(f).get("debug"))
+    except (OSError, ValueError):
+        pass
+    loop = GLib.MainLoop()
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    state = {"active": False, "ready": False, "failed": False}
+
+    def failed(message):
+        print("handheld-kbd: " + message, file=sys.stderr)
+        state["failed"] = True
+        loop.quit()
+
+    def finished(conn, result):
+        try:
+            conn.call_finish(result)
+        except GLib.Error as ex:
+            print("handheld-kbd: input-method keyboard request failed: " + str(ex), file=sys.stderr)
+
+    def notify(active):
+        state["active"] = active
+        if state["ready"]:
+            bus.call("org.handheld.Keyboard", "/org/handheld/Keyboard", "org.handheld.Keyboard",
+                     "InputMethod", GLib.Variant("(b)", (active,)), None,
+                     Gio.DBusCallFlags.NONE, 2000, None, finished)
+
+    def appeared(*_):
+        state["ready"] = True
+        if state["active"]:
+            notify(True)  # keyboard may have restarted while a field retained focus
+
+    def vanished(*_):
+        state["ready"] = False
+
+    def visibility_reply(conn, result):
+        try:
+            visible = conn.call_finish(result).unpack()[0]
+            notify(bool(visible and method.context))
+        except GLib.Error as ex:
+            failed("could not read KWin panel visibility: " + str(ex))
+
+    def visibility_changed(*_):
+        bus.call("org.kde.KWin", "/VirtualKeyboard", "org.freedesktop.DBus.Properties",
+                 "Get", GLib.Variant("(ss)", ("org.kde.kwin.VirtualKeyboard", "visible")),
+                 GLib.VariantType.new("(v)"), Gio.DBusCallFlags.NONE, 2000, None, visibility_reply)
+
+    def dismiss(conn, sender, path, interface, name, params, invocation):
+        # End the context, not the configured provider. A subsequent tap can
+        # activate the same text field again without disabling Plasma input.
+        bus.call("org.kde.KWin", "/VirtualKeyboard", "org.freedesktop.DBus.Properties",
+                 "Set", GLib.Variant("(ssv)", ("org.kde.kwin.VirtualKeyboard", "active",
+                                               GLib.Variant("b", False))), None,
+                 Gio.DBusCallFlags.NONE, 2000, None, finished)
+        invocation.return_value(None)
+
+    watch = Gio.bus_watch_name_on_connection(bus, "org.handheld.Keyboard",
+                                             Gio.BusNameWatcherFlags.NONE, appeared, vanished)
+    subscription = bus.signal_subscribe("org.kde.KWin", "org.kde.kwin.VirtualKeyboard", "visibleChanged",
+                                        "/VirtualKeyboard", None, Gio.DBusSignalFlags.NONE, visibility_changed)
+    method = InputMethod(notify, failed, debug, visibility_changed)
+    node = Gio.DBusNodeInfo.new_for_xml("<node><interface name='org.handheld.Keyboard.InputMethod'>"
+                                       "<method name='Dismiss'/></interface></node>")
+    registered = bus.register_object("/org/handheld/Keyboard/InputMethod", node.interfaces[0], dismiss, None, None)
+    owner = Gio.bus_own_name_on_connection(bus, "org.handheld.Keyboard.InputMethod",
+                                          Gio.BusNameOwnerFlags.NONE, None, None)
+    visibility_changed()
+    fd = method.lib.wl_display_get_fd(method.display)
+
+    def dispatch(_fd, condition):
+        if condition & (GLib.IO_HUP | GLib.IO_ERR):
+            failed("KWin input-method connection closed")
+            return False
+        if method.lib.wl_display_dispatch(method.display) < 0:
+            failed("KWin input-method event dispatch failed")
+            return False
+        flush()
+        return not state["failed"]
+
+    def writable(_fd, condition):
+        flush()
+        return False
+
+    def flush():
+        if method.lib.wl_display_flush(method.display) < 0:
+            if C.get_errno() == errno.EAGAIN:
+                GLib.io_add_watch(fd, GLib.IO_OUT, writable)
+            else:
+                failed("KWin input-method connection could not be flushed")
+
+    def stop(*_):
+        loop.quit()
+        return False
+
+    source = GLib.io_add_watch(fd, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, dispatch)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, stop)
+    print("handheld-kbd: Plasma input-method provider connected", file=sys.stderr)
+    try:
+        if not state["failed"]:
+            loop.run()
+    finally:
+        notify(False)
+        bus.flush_sync(None)
+        Gio.bus_unwatch_name(watch)
+        bus.signal_unsubscribe(subscription)
+        bus.unregister_object(registered)
+        Gio.bus_unown_name(owner)
+        method.close()
+    return int(state["failed"])
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, RuntimeError) as ex:
+        print("handheld-kbd: input-method failed: " + str(ex), file=sys.stderr)
+        sys.exit(1)

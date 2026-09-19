@@ -27,7 +27,7 @@ for node in tree.body:
         node.bases = []
         node.body = [m for m in node.body if isinstance(m, ast.FunctionDef) and m.name in methods]
         nodes.append(node)
-scope = {"json": json, "os": os, "sys": sys, "time": time,
+scope = {"DBUS": str(source.with_name("handheld-kbd-dbus")), "json": json, "os": os, "sys": sys, "time": time,
          "Gtk": SimpleNamespace(EventSequenceState=SimpleNamespace(CLAIMED=1))}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
 OSK = scope["OSK"]
@@ -103,7 +103,7 @@ with tempfile.TemporaryDirectory() as config_dir:
     scope["GLib"] = SimpleNamespace(timeout_add=lambda delay, callback: timers.append((delay, callback)))
     with patch("os.path.expanduser", return_value=str(rules)):
         assert w._prepare_hhd_trigger(lambda: started.append(True))
-        assert len(commands) == 10 and commands[-1][0] == "qdbus6"
+        assert len(commands) == 10 and commands[-1][0].endswith("handheld-kbd-dbus")
         assert timers[0][0] == 300 and not started
         assert timers[0][1]() is False and started == [True]
         rules.write_text("")
@@ -112,4 +112,44 @@ with tempfile.TemporaryDirectory() as config_dir:
         assert "protection unavailable" in log.getvalue()
         assert len(commands) == 10 and len(timers) == 1
 
-print("movement/config: margins, move/resize, release, persistence, migration, trigger startup protection passed")
+# Plasma owns automatic visibility; its delayed deactivation must not hide an M1
+# summon, and manually dismissing it must let a second tap on the same field work.
+main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+visibility = [n for n in main.body if isinstance(n, ast.FunctionDef)
+              and n.name in {"_show", "_hide", "_toggle", "_input_method"}]
+state = {"shown": False, "automatic": False, "input_method": False}
+timers, requests = [], []
+bus = SimpleNamespace(call=lambda *args: requests.append(args))
+gio = SimpleNamespace(bus_get_sync=lambda *_: bus, BusType=SimpleNamespace(SESSION=0),
+                      DBusCallFlags=SimpleNamespace(NO_AUTO_START=1))
+context = {"state": state, "GAMEMODE": False, "_mark_proven": lambda: None,
+           "w": SimpleNamespace(ensure_placed=lambda: None, show_all=lambda: None,
+                                hide=lambda: None, _debug=lambda text: None),
+           "_setvis": lambda v: state.update(shown=v == "1"),
+           "GLib": SimpleNamespace(timeout_add=lambda ms, fn: timers.append(fn), Error=RuntimeError)}
+exec(compile(ast.Module(body=visibility, type_ignores=[]), str(source), "exec"), context)
+with patch.dict(sys.modules, {"gi.repository": SimpleNamespace(Gio=gio)}):
+    context["_input_method"](True)
+    assert state["shown"] and state["automatic"]
+    context["_input_method"](False)
+    context["_input_method"](True)
+    timers.pop()()
+    assert state["shown"] and state["automatic"]  # moving to a second field has no flicker
+    context["_toggle"]()
+    assert not state["shown"] and requests[-1][3] == "Dismiss"
+    context["_input_method"](True)
+    assert not state["shown"]  # stale native visibility cannot undo manual dismissal
+    context["_input_method"](False)
+    context["_input_method"](True)
+    timers.pop()()
+    assert state["shown"] and state["automatic"]  # another tap on the same field
+    context["_input_method"](False)
+    timers.pop()()
+    assert not state["shown"]
+    context["_show"]()
+    context["_input_method"](True)
+    context["_input_method"](False)
+    timers.pop()()
+    assert state["shown"] and not state["automatic"]  # manual M1 ownership preserved
+
+print("movement/config: margins, move/resize, persistence, trigger protection, Plasma/M1 visibility passed")

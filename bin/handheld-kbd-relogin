@@ -43,7 +43,7 @@ if [ "${1:-}" = "--prompt" ] && command -v kdialog >/dev/null 2>&1; then
         # session out from under them. loginctl terminate-session is NOT a substitute —
         # on a Legion Go 2 it removed the session record and left an orphaned KWin that
         # SDDM would not replace, i.e. a desktop with no way back.
-        qdbus6 org.kde.Shutdown /Shutdown org.kde.Shutdown.logout
+        "$HOME/.local/bin/handheld-kbd-dbus" org.kde.Shutdown /Shutdown org.kde.Shutdown.logout
     fi
 else
     notify-send -a "Better Handheld Keyboard" -i input-keyboard \
