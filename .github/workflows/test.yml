@@ -15,7 +15,7 @@ jobs:
   locales:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Install xkb tooling
         run: |
@@ -59,7 +59,7 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Scripts parse
         run: |
           for f in install.sh uninstall.sh bin/*.sh bin/handheld-kbd-ctl \
@@ -81,7 +81,7 @@ jobs:
   upgrade:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: A layout from an older release gains this release's new keys
         # The upgrade path is never exercised by a fresh install, which is exactly why it
         # broke before: the code for a new key shipped while the user's layout kept no
@@ -113,7 +113,7 @@ jobs:
   regression:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - name: Install integration test libraries
         run: |
           sudo apt-get update -qq
